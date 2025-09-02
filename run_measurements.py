@@ -842,10 +842,12 @@ def main():
     # -------------------------- Measurement Execution --------------------------
     
     # Initialize CSV file for results with comprehensive metadata
-    with open(CSV_PATH, "w", newline="") as f:
+    file_exists = CSV_PATH.exists()
+    with open(CSV_PATH, "a" if file_exists else "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["mode","level","url","rep","pcap","plt_ms","t_wall_start","t_wall_end",
                                           "dyn_max_prob","dyn_min_pps","dyn_max_pps"])
-        w.writeheader()
+        if not file_exists:
+            w.writeheader()
 
         # Execute measurements based on selected mode
         if args.mode == "off":
