@@ -50,7 +50,7 @@ int handle_ingress(struct __sk_buff *skb) {
 SEC("classifier")
 int handle_egress(struct __sk_buff *skb) {
     // Pass '2' to represent Egress
-    return handle_packet(skb, 2);
+    return TC_ACT_OK;
 }
 
 char LICENSE[] SEC("license") = "GPL";

@@ -390,16 +390,17 @@ _loader_proc = None  # Global variable to track the eBPF loader process
 
 def set_loader(ns: str, mode: str, ifname: str, *, fixed_prob=None, dyn_max=None, dyn_min_pps=None, dyn_max_pps=None):
     """
-    Manages start/stop of the eBPF packet dropper based on experiment mode
+    Manages start/stop of the eBPF packet dropper/generator based on experiment mode
     
     This function controls the eBPF program that simulates network packet loss
-    by dropping UDP packets (targeting QUIC traffic) at specified rates.
+    by dropping UDP packets (targeting QUIC traffic) at specified rates, or
+    generates dummy packets.
     
     Args:
         ns: Network namespace to run loader in
-        mode: Operation mode ('off', 'fixed', 'dynamic')
+        mode: Operation mode ('off', 'fixed', 'dynamic', 'dummy')
         ifname: Network interface name to attach eBPF program to
-        fixed_prob: Percentage drop rate for 'fixed' mode (0-100)
+        fixed_prob: Percentage drop/clone rate for 'fixed'/'dummy' mode (0-100)
         dyn_max: Maximum drop percentage for 'dynamic' mode
         dyn_min_pps: Minimum packets/second threshold for dynamic dropping
         dyn_max_pps: Maximum packets/second threshold for dynamic dropping
@@ -408,6 +409,7 @@ def set_loader(ns: str, mode: str, ifname: str, *, fixed_prob=None, dyn_max=None
     - 'off': No packet dropping (baseline measurements)
     - 'fixed': Constant drop rate throughout the measurement
     - 'dynamic': Variable drop rate based on current traffic volume
+    - 'dummy': Constant dummy packet generation rate
     
     Why eBPF for packet dropping:
     - Kernel-level efficiency (no userspace context switching)
@@ -443,6 +445,11 @@ def set_loader(ns: str, mode: str, ifname: str, *, fixed_prob=None, dyn_max=None
     if mode == "fixed":
         # Fixed mode: constant drop probability throughout measurement
         cmd = f"{shlex.quote(str(LOADER_BIN))} {shlex.quote(ifname)} --mode fixed --prob {int(fixed_prob)}"
+    
+    elif mode == "dummy":  # <-- (1) 添加这个 ELIF 块
+        # Dummy mode: constant clone probability
+        cmd = f"{shlex.quote(str(LOADER_BIN))} {shlex.quote(ifname)} --mode dummy --prob {int(fixed_prob)}"
+
     elif mode == "dynamic":
         # Dynamic mode: drop rate varies based on current packet rate
         # Higher traffic = higher drop rate (simulates congestion)
@@ -754,6 +761,7 @@ def main():
     - 'off': Baseline measurements without packet dropping
     - 'fixed': Static drop rates at specified levels (e.g., 0%, 1%, 2%, 5%, 10%)
     - 'dynamic': Adaptive drop rates based on current traffic volume
+    - 'dummy': Static dummy packet generation rates
     
     Output: CSV file with columns for mode, level, URL, repetition, and timing metrics
     """
@@ -766,12 +774,14 @@ def main():
                         help="Network namespace name for traffic isolation")
     parser.add_argument("--urls", default="urls.txt", 
                         help="File containing list of URLs to test")
-    parser.add_argument("--mode", choices=["off","fixed","dynamic"], required=True,
-                        help="Packet dropping mode: off=baseline, fixed=constant rate, dynamic=adaptive")
     
-    # Fixed mode parameters
+    # <-- (2) 在 CHOICES 和 HELP 中添加 'dummy'
+    parser.add_argument("--mode", choices=["off","fixed","dynamic","dummy"], required=True,
+                        help="Packet dropping/generation mode: off=baseline, fixed=constant rate, dynamic=adaptive, dummy=constant dummy packet rate")
+    
+    # Fixed / Dummy mode parameters
     parser.add_argument("--levels", default="0,1,2,5,10", 
-                        help="Comma-separated drop percentages for fixed mode")
+                        help="Comma-separated drop/clone percentages for fixed/dummy mode")
     parser.add_argument("--runs-per-level", type=int, default=10,
                         help="Number of measurement repetitions per drop level")
     
@@ -902,7 +912,36 @@ def main():
             # Disable eBPF loader after fixed mode measurements
             set_loader(args.ns, "off", ifname)
 
-        else:  # dynamic mode
+        elif args.mode == "dummy":  # <-- (3) 添加这个完整的 ELIF 块
+            """
+            Dummy Mode: Constant dummy packet generation
+            
+            Tests specific clone percentages. This re-uses the 'levels' argument
+            to define the probability of cloning a packet.
+            """
+            levels = [int(x) for x in args.levels.split(",") if x.strip()]
+            
+            for lvl in levels:
+                print(f"[INFO] Starting dummy packet measurements at level {lvl}%")
+                
+                # Configure eBPF loader for this clone rate
+                set_loader(args.ns, "dummy", ifname, fixed_prob=lvl)
+                
+                for rep in range(1, args.runs_per_level+1):
+                    random.shuffle(urls)  # Randomize URL order
+                    for url in tqdm(urls, desc=f"dummy {lvl}% rep {rep}/{args.runs_per_level}"):
+                        tag = f"dummy{lvl}_rep{rep}_{url.replace('://','_').replace('/','_')}_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+                        
+                        # Perform measurement and save results with clone level metadata
+                        pcap, nav = capture_one(args.ns, url, tag, args.headless, chrome)
+                        w.writerow({"mode":"dummy","level":lvl,"url":url,"rep":rep,"pcap":pcap,
+                                    "plt_ms":nav["plt_ms"],"t_wall_start":nav["t_wall_start"],"t_wall_end":nav["t_wall_end"],
+                                    "dyn_max_prob":"","dyn_min_pps":"","dyn_max_pps":""}); f.flush()
+            
+            # Disable eBPF loader after dummy mode measurements
+            set_loader(args.ns, "off", ifname)
+
+        elif args.mode == "dynamic": # <-- (4) 把 'else:' 改为 'elif'
             """
             Dynamic Mode: Adaptive packet dropping
             
@@ -912,9 +951,9 @@ def main():
             """
             # Configure eBPF loader for dynamic mode with specified parameters
             set_loader(args.ns, "dynamic", ifname,
-                       dyn_max=args.dynamic_max_prob, 
-                       dyn_min_pps=args.dynamic_min_pps, 
-                       dyn_max_pps=args.dynamic_max_pps)
+                           dyn_max=args.dynamic_max_prob, 
+                           dyn_min_pps=args.dynamic_min_pps, 
+                           dyn_max_pps=args.dynamic_max_pps)
             
             for rep in range(1, args.runs_per_level+1):
                 random.shuffle(urls)  # Randomize URL order

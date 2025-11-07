@@ -227,7 +227,7 @@ if ! python3 -c "from selenium import webdriver; print('Selenium import OK')" 2>
 fi
 
 # Experiment 1: Baseline measurements (no eBPF, truly off)
-print_status "Experiment 1/3: Baseline measurements (no packet dropping)"
+print_status "Experiment 1/4: Baseline measurements (no packet dropping)"
 if env DISPLAY="$DISPLAY" HOME="$HOME" USER="$USER" PATH="$PATH" python3 run_measurements.py --mode off --runs-per-level 10; then
     print_success "Baseline measurements completed"
 else
@@ -236,7 +236,7 @@ else
 fi
 
 # Experiment 2: Fixed drop level measurements (skip 0% since we have baseline)
-print_status "Experiment 2/3: Fixed drop level measurements (1%, 2%, 5%, 10%, 20%)"
+print_status "Experiment 2/4: Fixed drop level measurements (1%, 2%, 5%, 10%, 20%)"
 if env DISPLAY="$DISPLAY" HOME="$HOME" USER="$USER" PATH="$PATH" python3 run_measurements.py --mode fixed --levels "1,2,5,10,20" --runs-per-level 10; then
     print_success "Fixed drop level measurements completed"
 else
@@ -244,8 +244,22 @@ else
     exit 1
 fi
 
+# --- 这是你新添加的块 ---
+# Experiment 3: Dummy packet generation measurements
+print_status "Experiment 3/4: Dummy packet generation measurements (1%, 2%, 5%, 10%, 20%)"
+if env DISPLAY="$DISPLAY" HOME="$HOME" USER="$USER" PATH="$PATH" python3 run_measurements.py \
+    --mode dummy \
+    --levels "1,2,5,10,20" \
+    --runs-per-level 10; then
+    print_success "Dummy packet generation measurements completed"
+else
+    print_error "Error during dummy packet generation measurements"
+    exit 1
+fi
+# --- 新添加的块结束 ---
+
 # Experiment 3: Dynamic packet dropping measurements
-print_status "Experiment 3/3: Dynamic packet dropping measurements"
+print_status "Experiment 4/4: Dynamic packet dropping measurements"
 if env DISPLAY="$DISPLAY" HOME="$HOME" USER="$USER" PATH="$PATH" python3 run_measurements.py --mode dynamic --runs-per-level 10 --dynamic-max-prob 50 --dynamic-min-pps 1000 --dynamic-max-pps 100000; then
     print_success "Dynamic measurements completed"
 else

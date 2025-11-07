@@ -19,13 +19,20 @@ CC ?= gcc
 UCFLAGS := -O2 -g -Wall
 ULIBS := -lbpf -lelf -lz
 
-all: packet_dropper.bpf.o loader
+# --- 修正这里 ---
+# 'all' 必须包含 *所有* 你想默认编译的文件
+all: packet_dropper.bpf.o dummy_generator.bpf.o loader
 
 packet_dropper.bpf.o: packet_dropper.bpf.c
+	$(BPF_CLANG) $(BPF_CFLAGS) -c $< -o $@
+
+# (这条规则是正确的，保持不变)
+dummy_generator.bpf.o: dummy_generator.bpf.c parse_helpers.h
 	$(BPF_CLANG) $(BPF_CFLAGS) -c $< -o $@
 
 loader: loader.c
 	$(CC) $(UCFLAGS) $< -o $@ $(ULIBS)
 
 clean:
-	rm -f packet_dropper.bpf.o loader
+    # (这里你写了两行，我帮你合并成一行)
+	rm -f packet_dropper.bpf.o dummy_generator.bpf.o loader

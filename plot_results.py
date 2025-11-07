@@ -5,17 +5,54 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 OUT = Path("out")
-PLOTS = OUT / "plot"  # Use out/plot directory
+PLOTS = OUT / "plots"  # Use out/plot directory
 PLOTS.mkdir(parents=True, exist_ok=True)
 
-summary = pd.read_csv(OUT / "summary.csv")
-iat_up = pd.read_csv(OUT / "iat_up.csv")
-iat_down = pd.read_csv(OUT / "iat_down.csv")
+# --- 1. 加载数据 ---
+try:
+    summary = pd.read_csv(OUT / "summary.csv")
+    iat_up = pd.read_csv(OUT / "iat_up.csv")
+    iat_down = pd.read_csv(OUT / "iat_down.csv")
+except FileNotFoundError as e:
+    print(f"Error: {e}.")
+    print("Please run analyse_pcaps.py first.")
+    exit(1)
 
-# Debug: Print data summary
+# --- 2. 关键修复：创建一个“组合标签”列 ---
+def create_label(df):
+    if 'mode' not in df.columns:
+        print("Error: 'mode' column not found in CSV. Did analyse_pcaps.py run correctly?")
+        return df # 返回原始df以避免崩溃
+
+    # 填充 'off' 模式可能缺失的 'mode'
+    df['mode'] = df['mode'].fillna('off')
+    
+    # 将 level 转换为字符串
+    label = df['level'].astype(str)
+    
+    # 定义条件
+    is_off = (df['mode'] == 'off')
+    is_dynamic = (df['mode'] == 'dynamic')
+    is_fixed = (df['mode'] == 'fixed')
+    is_dummy = (df['mode'] == 'dummy') # <-- (这里是修正点)
+
+    # 应用新标签
+    label[is_off] = "0% (Baseline)"
+    label[is_dynamic] = "Dynamic"
+    label[is_fixed] = label[is_fixed].str.replace(r'\.0$', '', regex=True) + "% (Fixed)"
+    label[is_dummy] = label[is_dummy].str.replace(r'\.0$', '', regex=True) + "% (Dummy)"
+    
+    df['label'] = label
+    return df
+
+summary = create_label(summary)
+iat_up = create_label(iat_up)
+iat_down = create_label(iat_down)
+
+# Debug: 打印新的标签信息
 print(f"Summary data shape: {summary.shape}")
-print(f"Levels found: {sorted(summary['level'].unique())}")
-print(f"Level counts: {summary['level'].value_counts().sort_index()}")
+print(f"Labels found: {sorted(summary['label'].unique())}")
+print(f"Label counts: {summary['label'].value_counts().sort_index()}")
 print(f"Metrics available: {list(summary.columns)}")
 print()
 
@@ -35,23 +72,36 @@ def format_value_with_unit(value, unit):
 
 def agg_bar_ci(df, metric, fname, title, ylabel=None, unit=""):
     """Create bar chart with confidence intervals and professional styling"""
-    g = df.groupby("level")[metric].agg(['mean','count','std']).reset_index()
+    
+    # --- 修复 3: 按新的 'label' 列分组 ---
+    g = df.groupby("label")[metric].agg(['mean','count','std']).reset_index()
     g['sem'] = g['std'] / np.sqrt(g['count'])
     g['ci95'] = 1.96 * g['sem']
     
-    # Sort by level to ensure proper order (0, 1, 2, 5, 10, 20)
-    g = g.sort_values('level')
+    # --- 修复 4: 动态创建排序顺序 ---
+    all_labels = sorted(df['label'].unique())
+    level_order = ['0% (Baseline)']
+    # 智能排序：1%, 1% (dummy), 10%, 10% (dummy), 2%, 2% (dummy)...
+    other_labels = sorted([l for l in all_labels if l not in level_order and l != 'Dynamic'], 
+                          key=lambda x: (int(x.split('%')[0]), x))
+    level_order.extend(other_labels)
+    if "Dynamic" in all_labels:
+        level_order.append("Dynamic")
 
-    plt.figure(figsize=(10, 6))
-    bars = plt.bar(g['level'].astype(str), g['mean'], yerr=g['ci95'], capsize=4, 
+    g['label'] = pd.Categorical(g['label'], categories=level_order, ordered=True)
+    g = g.sort_values('label').dropna(subset=['label']) # 丢弃任何意外的标签
+
+    plt.figure(figsize=(12, 7)) # 增加宽度以容纳更多条
+    bars = plt.bar(g['label'].astype(str), g['mean'], yerr=g['ci95'], capsize=4, 
                    color='steelblue', alpha=0.7, edgecolor='navy', linewidth=0.8)
     
-    plt.xlabel("Packet Drop Probability (%)", fontsize=12, fontweight='bold')
+    # --- 修复 5: 更新X轴标签 ---
+    plt.xlabel("Experiment Mode and Level", fontsize=12, fontweight='bold')
+    plt.xticks(rotation=45, ha='right') # 旋转标签以防重叠
     
-    # Use custom ylabel if provided, otherwise use metric name
+    # (Y轴标签逻辑保持不变)
     y_label = ylabel if ylabel else metric
     if unit:
-        # For bytes, show appropriate unit based on magnitude
         if unit == "bytes":
             max_val = g['mean'].max()
             if max_val >= 1024*1024:
@@ -70,14 +120,14 @@ def agg_bar_ci(df, metric, fname, title, ylabel=None, unit=""):
     plt.ylabel(y_label, fontsize=12, fontweight='bold')
     plt.title(title, fontsize=14, fontweight='bold', pad=20)
     
-    # Show actual values on bars for clarity
+    # (在条形图上显示值的逻辑保持不变)
     for i, (idx, row) in enumerate(g.iterrows()):
         formatted_val, display_unit = format_value_with_unit(row['mean'], unit)
         plt.text(i, row['mean'] + row['ci95'] + max(g['mean']) * 0.02, 
-                f"{formatted_val}\n(n={row['count']})", 
-                ha='center', va='bottom', fontsize=9, fontweight='bold')
+                 f"{formatted_val}\n(n={int(row['count'])})", 
+                 ha='center', va='bottom', fontsize=9, fontweight='bold')
     
-    # Professional styling
+    # (样式逻辑保持不变)
     plt.grid(True, axis='y', alpha=0.3, linestyle='--')
     plt.gca().spines['top'].set_visible(False)
     plt.gca().spines['right'].set_visible(False)
@@ -86,54 +136,61 @@ def agg_bar_ci(df, metric, fname, title, ylabel=None, unit=""):
     plt.savefig(PLOTS / fname, dpi=180, bbox_inches='tight')
     plt.close()
     
-    # Debug print
-    print(f"✓ Generated {fname}: {len(g)} levels found: {list(g['level'])}")
+    # --- 修复 6: 更新调试打印信息 ---
+    print(f"✓ Generated {fname}: {len(g)} labels found: {list(g['label'])}")
 
 def plot_comparative_cdf(df, metric_col, fname, title, xlabel):
     """Create comparative CDF plot showing all levels on the same chart"""
     if len(df) == 0:
         print(f"⚠️  Warning: Empty data for {fname}")
         return
-    
+
     plt.figure(figsize=(10, 7))
-    
-    # Define colors for different levels
-    colors = plt.cm.viridis(np.linspace(0, 1, len(df['level'].unique())))
-    level_colors = dict(zip(sorted(df['level'].unique()), colors))
-    
-    # Plot CDF for each level
-    for level, level_data in df.groupby('level'):
-        if len(level_data) == 0:
+
+    # --- 修复 7: 按 'label' 分组和上色 ---
+    all_labels = sorted(df['label'].unique())
+    colors = plt.cm.viridis(np.linspace(0, 1, len(all_labels)))
+    label_colors = dict(zip(all_labels, colors))
+
+    # Plot CDF for each label
+    for label, label_data in df.groupby('label'): # <-- 按 'label' 分组
+        if len(label_data) == 0:
             continue
-            
-        series = level_data[metric_col].dropna()
+
+        series = label_data[metric_col].dropna()
         if len(series) == 0:
             continue
-            
+
         x = np.sort(series.values)
+        x = x * 1000  # FIX 1: Convert to milliseconds (原脚本中已有)
         y = np.arange(1, len(x)+1) / len(x)
+
+        # --- 修复 8: 更新图例标签 ---
+        label_text = f"{label} (n={len(series)})" # e.g., "10% (Dummy) (n=12345)"
         
-        plt.plot(x, y, linewidth=2.5, alpha=0.8, color=level_colors[level],
-                label=f'{level}% drop rate (n={len(series)})')
-    
-    plt.xlabel(xlabel, fontsize=12, fontweight='bold')
+        plt.plot(x, y, linewidth=2.5, alpha=0.8, color=label_colors[label],
+                 label=label_text) # <-- 使用新的 label_text
+
+    plt.xlabel("Inter-Arrival Time (ms)", fontsize=12, fontweight='bold') # FIX 2: Update Label (原脚本中已有)
     plt.ylabel("Cumulative Distribution Function (CDF)", fontsize=12, fontweight='bold')
     plt.title(title, fontsize=14, fontweight='bold', pad=20)
-    
-    # Professional styling
+
+    # (样式逻辑保持不变)
     plt.grid(True, which='both', axis='both', alpha=0.3, linestyle='--')
     plt.gca().spines['top'].set_visible(False)
     plt.gca().spines['right'].set_visible(False)
-    
-    # Legend
-    plt.legend(loc='lower right', frameon=True, fancybox=True, shadow=True)
-    
-    plt.tight_layout()
-    plt.savefig(PLOTS / fname, dpi=180, bbox_inches='tight')
-    plt.close()
-    
-    print(f"✓ Generated comparative {fname}: {len(df['level'].unique())} levels compared")
 
+    plt.xlim(0, 100) # FIX 3: Zoom in on X-axis (原脚本中已有)
+    plt.xscale('symlog')
+    plt.legend(loc='lower right', frameon=True, fancybox=True, shadow=True)
+
+    plt.savefig(PLOTS / fname, dpi=180, bbox_inches='tight') # FIX 4: (原脚本中已有)
+    plt.close()
+
+    # --- 修复 9: 更新调试打印信息 ---
+    print(f"✓ Generated comparative {fname}: {len(df['label'].unique())} labels compared")
+
+# (主运行逻辑不需要修改，因为它只是调用上面的函数)
 # Generate professional bar charts with clear labels and units
 plot_configs = [
     ("plt_ms", "bar_plt_ms.png", "Page Load Time vs Packet Loss", "Page Load Time", "ms"),
@@ -156,9 +213,11 @@ print("\nGenerating Comparative Inter-Arrival Time CDFs...")
 
 # IAT data already has level information - no need to merge
 plot_comparative_cdf(iat_up, "iat_s", "cdf_iat_uplink_comparative.png",
-                    "Comparative Inter-Arrival Time Distribution - Upload Traffic",
-                    "Inter-Arrival Time (seconds)")
+                     "Comparative Inter-Arrival Time Distribution - Upload Traffic",
+                     "Inter-Arrival Time (ms)")
 
 plot_comparative_cdf(iat_down, "iat_s", "cdf_iat_downlink_comparative.png", 
-                    "Comparative Inter-Arrival Time Distribution - Download Traffic",
-                    "Inter-Arrival Time (seconds)")
+                     "Comparative Inter-Arrival Time Distribution - Download Traffic",
+                     "Inter-Arrival Time (ms)")
+
+print("\nAll plots generated successfully in out/plots/")
