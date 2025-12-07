@@ -1,0 +1,801 @@
+#!/usr/bin/env python3
+"""
+Web Flow Evaluation Tool - Core Measurement Script
+
+***
+This script accepts a command-line argument for the output directory.
+Usage:
+  python3 run_measurements.py --mode fixed ... --out-dir [MY_DIR]
+***
+"""
+
+import os, csv, time, shlex, signal, tempfile, random, argparse, atexit, shutil, re, subprocess
+from pathlib import Path
+from datetime import datetime
+from contextlib import contextmanager
+from tqdm import tqdm
+
+
+parser = argparse.ArgumentParser(description="QUIC WF eval runner (Selenium + tcpdump + eBPF loader)")
+
+# --- 2. 动态设置路径 ---
+parser.add_argument("--out-dir", default="out",
+                    help="Output directory for all measurement results (default: 'out')")
+parser.add_argument("--ns", default="wfns", 
+                    help="Network namespace name for traffic isolation")
+parser.add_argument("--urls", default="urls.txt", 
+                    help="File containing list of URLs to test")
+parser.add_argument("--mode", choices=["off","fixed","dynamic","dummy"], required=True,
+                    help="Packet dropping/generation mode")
+# (其他参数将在 main 函数中添加)
+
+# --- 3. 解析 *已知* 的参数 (只为了获取 out-dir) ---
+# 使用 parse_known_args()，这样 main 函数中的完整解析器也不会出错
+cli_args, _ = parser.parse_known_args()
+
+# --- 4. 定义全局路径 (现在是动态的) ---
+NS_DEFAULT = cli_args.ns
+OUT_DIR    = Path(cli_args.out_dir) # <-- 关键修复
+PCAPS_DIR  = OUT_DIR / "pcaps"
+CSV_PATH   = OUT_DIR / "nav_metrics.csv"
+EBPF_DIR   = Path("ebpf")
+LOADER_BIN = EBPF_DIR / "loader"
+
+# --- Shell Command Utilities (保持不变) ---
+def sh(cmd: str):
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+def ns_sh(ns: str, cmd: str):
+    return sh(f"ip netns exec {shlex.quote(ns)} sh -lc {shlex.quote(cmd)}")
+
+def run_in_ns(ns: str, cmd: str, env=None):
+    return subprocess.Popen(f"ip netns exec {shlex.quote(ns)} {cmd}", shell=True, env=env, preexec_fn=os.setsid)
+
+# --- Namespace Management (保持不变) ---
+def clean_namespace(ns: str):
+    print(f"[INFO] Cleaning namespace {ns}...")
+    patterns = ["chrome.*--enable-quic", "chromedriver", "tcpdump.*veth1"]
+    for pattern in patterns:
+        ns_sh(ns, f"pkill -f '{pattern}' 2>/dev/null || true")
+    time.sleep(0.5)
+    print(f"[SUCCESS] Namespace {ns} cleaned")
+
+# --- Traffic Control (保持不变) ---
+def setup_traffic_control():
+    print("[INFO] Setting up traffic control...")
+    wan_if = sh("ip route get 1.1.1.1 | awk '/dev/ {print $5; exit}'").stdout.strip()
+    if not wan_if:
+        print("[WARNING] Could not detect WAN interface, skipping traffic control")
+        return None
+    
+    print(f"[INFO] Applying traffic control on interface: {wan_if}")
+    commands = [
+        f"tc qdisc add dev {wan_if} root handle 1: htb default 30",
+        f"tc class add dev {wan_if} parent 1: classid 1:1 htb rate 100mbit",
+        f"tc class add dev {wan_if} parent 1:1 classid 1:10 htb rate 90mbit ceil 95mbit",  
+        f"tc class add dev {wan_if} parent 1:1 classid 1:30 htb rate 10mbit ceil 20mbit",  
+        f"tc filter add dev {wan_if} parent 1: protocol ip prio 1 u32 match ip src 10.200.0.0/24 classid 1:10",
+        f"tc filter add dev {wan_if} parent 1: protocol ip prio 2 u32 match ip src 0.0.0.0/0 classid 1:30"
+    ]
+    for cmd in commands:
+        result = sh(f"sudo {cmd}")
+        if result.returncode != 0:
+            print(f"[ERROR] Traffic control setup failed: {cmd}")
+            cleanup_traffic_control()
+            return None
+    
+    print("[SUCCESS] Traffic control active")
+    return wan_if
+
+def cleanup_traffic_control():
+    wan_if = sh("ip route get 1.1.1.1 | awk '/dev/ {print $5; exit}'").stdout.strip()
+    if wan_if:
+        print(f"[INFO] Removing traffic control from {wan_if}")
+        sh(f"sudo tc qdisc del dev {wan_if} root 2>/dev/null || true")
+        print("[SUCCESS] Traffic control removed")
+
+# --- Chrome Management (保持不变) ---
+def pick_chrome_binary():
+    for p in ("/usr/bin/google-chrome","/usr/bin/google-chrome-stable","/usr/bin/chromium",
+              "/usr/lib/chromium-browser/chromium-browser","/usr/bin/chromium-browser","/snap/bin/chromium"):
+        if os.path.exists(p) and os.access(p, os.X_OK):
+            try:
+                if "/snap/" in os.path.realpath(p):  
+                    continue
+            except Exception: pass
+            return p
+    return "/snap/bin/chromium"
+
+def get_chrome_major(ns: str, chrome_bin: str):
+    out = ns_sh(ns, f"{shlex.quote(chrome_bin)} --version || true").stdout.strip()
+    m = re.search(r"\b(\d+)\.", out)
+    return int(m.group(1)) if m else None
+
+def find_chromedriver_for_major(major: int):
+    for p in ("/usr/bin/chromedriver","/usr/lib/chromium-browser/chromedriver",
+              "/usr/lib/chromium/chromedriver","/usr/local/bin/chromedriver"):
+        if os.path.exists(p) and os.access(p, os.X_OK):
+            try:
+                out = subprocess.run([p,"--version"], capture_output=True, text=True).stdout
+                m = re.search(r"\b(\d+)\.", out)
+                if int(m.group(1)) == major:
+                    return p
+            except Exception: pass
+    return None
+
+@contextmanager
+def ns_wrapper(target_bin: str, ns: str):
+    fd, path = tempfile.mkstemp(prefix="nswrap-", suffix=".sh")
+    try:
+        os.write(fd, f"#!/bin/sh\nexec ip netns exec {shlex.quote(ns)} {shlex.quote(target_bin)} \"$@\"\n".encode())
+        os.fsync(fd); os.fchmod(fd, 0o755)
+    finally:
+        os.close(fd)
+    try:
+        yield path
+    finally:
+        try: os.unlink(path)
+        except Exception: pass
+
+# --- QUIC-Only Firewall (保持不变) ---
+def quic_only_install(ns: str):
+    script = r"""
+add table inet quiconly 2>/dev/null
+add chain inet quiconly out { type filter hook output priority 0; policy accept; } 2>/dev/null
+add rule inet quiconly out udp dport 443 accept 2>/dev/null
+add rule inet quiconly out tcp dport 443 reject 2>/dev/null
+"""
+    ns_sh(ns, "nft -f - <<'EOF'\n" + script + "EOF")
+
+def quic_only_uninstall(ns: str):
+    ns_sh(ns, "nft delete table inet quiconly 2>/dev/null || true")
+
+# --- eBPF Loader (保持不变) ---
+_loader_proc = None 
+def set_loader(ns: str, mode: str, ifname: str, *, fixed_prob=None, dyn_max=None, dyn_min_pps=None, dyn_max_pps=None):
+    global _loader_proc
+    if _loader_proc and _loader_proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(_loader_proc.pid), signal.SIGINT)
+            _loader_proc.wait(timeout=3)
+        except Exception:
+            try: os.killpg(os.getpgid(_loader_proc.pid), signal.SIGTERM)
+            except Exception: pass
+    _loader_proc = None
+    
+    if mode == "off":
+        return
+    if not LOADER_BIN.exists():
+        raise SystemExit("ERROR: build the loader first:  (cd ebpf && make)")
+    
+    if mode == "fixed":
+        cmd = f"{shlex.quote(str(LOADER_BIN))} {shlex.quote(ifname)} --mode fixed --prob {int(fixed_prob)}"
+    elif mode == "dummy":
+        cmd = f"{shlex.quote(str(LOADER_BIN))} {shlex.quote(ifname)} --mode dummy --prob {int(fixed_prob)}"
+    elif mode == "dynamic":
+        cmd = (f"{shlex.quote(str(LOADER_BIN))} {shlex.quote(ifname)} --mode dynamic "
+               f"--max-prob {int(dyn_max)} --min-rate {int(dyn_min_pps)} --max-rate {int(dyn_max_pps)}")
+    else:
+        raise ValueError(f"Unknown eBPF mode: {mode}")
+    
+    _loader_proc = run_in_ns(ns, cmd)
+    time.sleep(3)  
+    if _loader_proc.poll() is not None:
+        raise SystemExit(f"[ERROR] Loader process failed to start (exit code: {_loader_proc.poll()})")
+atexit.register(lambda: set_loader(NS_DEFAULT, "off", "lo"))
+
+# --- Network Diagnostics (保持不变) ---
+def autodetect_iface(ns: str):
+    p = ns_sh(ns, "ip -o -4 route show default | awk '{print $5}'")
+    if p.returncode == 0 and p.stdout.strip():
+        return p.stdout.strip()
+    p = ns_sh(ns, "ip -o link show | awk -F': ' '$2!~/lo/ {print $2; exit}'")
+    return p.stdout.strip() or "eth0"
+# (ns_has_udp443, ns_diag... 保持不变)
+
+# --- Web Navigation (保持不变) ---
+def measure_nav(ns: str, chrome_bin: str, url: str, headless: bool):
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+
+    major = get_chrome_major(ns, chrome_bin)
+    if not major:
+        raise SystemExit(f"Chrome not found/unreadable in {ns}: {chrome_bin}")
+    cdrv = find_chromedriver_for_major(major)
+    if not cdrv:
+        raise SystemExit(f"chromedriver {major}.x not found. Install one aligned with Chrome {major}.x")
+
+    with ns_wrapper(chrome_bin, ns) as chrome_in_ns:
+        opts = Options()
+        for a in ("--no-first-run","--disable-extensions","--disable-background-networking",
+                  "--disable-sync","--incognito","--disk-cache-size=1",
+                  "--disable-application-cache","--disable-back-forward-cache",
+                  "--disable-background-timer-throttling","--disable-renderer-backgrounding",
+                  "--disable-features=TranslateUI,BlinkGenPropertyTrees",
+                  "--enable-quic","--enable-features=UseDnsHttpsSvcb,UseDnsHttpsSvcbAlpn",
+                  "--no-sandbox","--disable-dev-shm-usage","--remote-debugging-pipe"):
+            opts.add_argument(a)
+        
+        if headless:
+            opts.add_argument("--headless=new")
+            opts.add_argument("--hide-scrollbars") 
+            opts.add_argument("--disable-gpu")
+            
+        profile = tempfile.mkdtemp(prefix="chrome-prof-")
+        opts.add_argument(f"--user-data-dir={profile}")
+        opts.binary_location = chrome_in_ns
+        
+        drv = webdriver.Chrome(service=Service(executable_path=cdrv), options=opts)
+
+        try:
+            drv.set_page_load_timeout(120)
+            drv.execute_cdp_cmd('Network.setCacheDisabled', {'cacheDisabled': True})
+            drv.execute_cdp_cmd('Network.clearBrowserCache', {})
+            
+            t0 = time.time()
+            drv.get(url)
+            
+            for _ in range(450):
+                if drv.execute_script("return document.readyState") == "complete":
+                    break
+                time.sleep(0.1)
+            
+            nav = drv.execute_script("return performance.getEntriesByType('navigation')[0] || {}")
+            plt_ms = (nav.get("loadEventEnd", 0) - nav.get("startTime", 0)) or 0
+            time.sleep(5)
+            return {"plt_ms": plt_ms, "t_wall_start": t0, "t_wall_end": time.time()}
+        except KeyboardInterrupt:
+            print(f"[INFO] Navigation interrupted by user for {url}")
+            return {"plt_ms": 0, "t_wall_start": t0, "t_wall_end": time.time()}
+        except Exception as e:
+            print(f"[ERROR] Navigation failed for {url}: {e}")
+            return {"plt_ms": 0, "t_wall_start": t0, "t_wall_end": time.time()}
+        finally:
+            drv.quit()
+            shutil.rmtree(profile, ignore_errors=True)
+
+# --- Capture Functions (保持不变) ---
+@contextmanager
+def tcpdump_veth1(ns: str, outfile: Path, bpf: str):
+    proc = run_in_ns(ns, f"tcpdump -i veth1 -w {shlex.quote(str(outfile))} -U -n {shlex.quote(bpf)}")
+    time.sleep(0.6)
+    try:
+        yield
+    finally:
+        try: os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+        except Exception: pass
+        try: proc.wait(timeout=5)
+        except Exception: pass
+
+def capture_one(ns: str, url: str, tag: str, headless: bool, chrome_bin: str):
+    # pcap 路径现在使用全局的 PCAPS_DIR (它是由 --out-dir 决定的)
+    pcap = PCAPS_DIR / f"{tag}.pcap"
+    nav = {}
+    
+    with tcpdump_veth1(ns, pcap, "udp and port 443"):
+        nav = measure_nav(ns, chrome_bin, url, headless)
+    
+    try:
+        ci = ns_sh(ns, f"capinfos -c {shlex.quote(str(pcap))} 2>/dev/null | awk -F': ' '/Number of packets/ {{print $2}}'").stdout.strip()
+        pkt = int(ci) if ci.isdigit() else (pcap.stat().st_size > 24)
+    except Exception:
+        pkt = (pcap.stat().st_size > 24)
+
+    if not pkt:
+        print(f"[warn] empty pcap for {url}. The site may not use QUIC.")
+        
+    # --- 关键修复：返回 *相对* 路径 ---
+    # 我们返回相对于项目根目录的路径，这样 analyse_pcaps.py 才能找到它
+    return str(pcap), nav or {"plt_ms":0,"t_wall_start":0,"t_wall_end":0}
+
+
+# --- Main Execution Logic ---
+def main():
+    # --- 5. 添加剩余的参数 ---
+    # (注意：--out-dir, --ns, --urls, --mode 已经在脚本顶部添加了)
+    parser.add_argument("--levels", default="0,1,2,5,10", 
+                        help="Comma-separated drop/clone percentages for fixed/dummy mode")
+    parser.add_argument("--runs-per-level", type=int, default=10,
+                        help="Number of measurement repetitions per drop level")
+    parser.add_argument("--dynamic-max-prob", type=int, default=50,
+                        help="Maximum drop percentage in dynamic mode")
+    parser.add_argument("--dynamic-min-pps", type=int, default=1000,
+                        help="Minimum packets/sec for dynamic dropping activation")
+    parser.add_argument("--dynamic-max-pps", type=int, default=100000,
+                        help="Maximum packets/sec for full dynamic drop rate")
+    parser.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True,
+                        help="Run Chrome in headless mode (no GUI)")
+    parser.add_argument("--quic-only", action=argparse.BooleanOptionalAction, default=True,
+                        help="Install firewall rules to force QUIC protocol usage")
+    parser.add_argument("--traffic-control", action=argparse.BooleanOptionalAction, default=True, 
+                        help="Enable traffic control to isolate experiment traffic from host interference")
+    
+    # --- 6. 完整解析参数 ---
+    args = parser.parse_args()
+    
+    # --- Environment Setup (使用全局路径) ---
+    print(f"[SETUP] Using output directory: {OUT_DIR.resolve()}")
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    PCAPS_DIR.mkdir(parents=True, exist_ok=True) # <-- 确保 pcaps 目录也被创建
+
+    test_ns = subprocess.run(["ip", "netns", "exec", args.ns, "true"], capture_output=True)
+    if test_ns.returncode != 0:
+        raise SystemExit(f"Permission denied to enter namespace '{args.ns}'. Run with sudo -E.")
+
+    chrome = pick_chrome_binary()
+    if args.quic_only:
+        quic_only_install(args.ns)
+        atexit.register(lambda: quic_only_uninstall(args.ns))
+    
+    clean_namespace(args.ns)
+    
+    if args.traffic_control:
+        tc_interface = setup_traffic_control()
+        if tc_interface:
+            atexit.register(cleanup_traffic_control)
+    
+    ifname = autodetect_iface(args.ns)
+    print(f"[preflight] ns={args.ns} if={ifname} chrome={chrome} major={get_chrome_major(args.ns, chrome)}")
+    print("[preflight] ping 1.1.1.1 ->", ns_sh(args.ns, "ping -c1 -W1 1.1.1.1 >/dev/null && echo OK || echo FAIL").stdout.strip())
+
+    urls = [u.strip() for u in open(args.urls) if u.strip() and not u.startswith("#")]
+    random.seed(123)
+
+    # --- Measurement Execution (使用全局路径) ---
+    file_exists = CSV_PATH.exists()
+    with open(CSV_PATH, "a" if file_exists else "w", newline="") as f:
+        # (确保 fieldnames 包含 'mode')
+        fieldnames=["mode","level","url","rep","pcap","plt_ms","t_wall_start","t_wall_end",
+                    "dyn_max_prob","dyn_min_pps","dyn_max_pps"]
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            w.writeheader()
+
+        # (模式循环保持不变)
+        if args.mode == "off":
+            print("[INFO] Starting baseline measurements (mode: off)")
+            set_loader(args.ns, "off", ifname)
+            for rep in range(1, args.runs_per_level+1):
+                random.shuffle(urls)
+                for url in tqdm(urls, desc=f"baseline {rep}/{args.runs_per_level}"):
+                    tag = f"off_rep{rep}_{url.replace('://','_').replace('/','_')}_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+                    pcap, nav = capture_one(args.ns, url, tag, args.headless, chrome)
+                    w.writerow({"mode":"off","level":0,"url":url,"rep":rep,"pcap":pcap,
+                                "plt_ms":nav["plt_ms"],"t_wall_start":nav["t_wall_start"],"t_wall_end":nav["t_wall_end"]}); f.flush()
+
+        elif args.mode == "fixed" or args.mode == "dummy":
+            levels = [int(x) for x in args.levels.split(",") if x.strip()]
+            for lvl in levels:
+                print(f"[INFO] Starting {args.mode} mode measurements at level {lvl}%")
+                set_loader(args.ns, args.mode, ifname, fixed_prob=lvl)
+                
+                for rep in range(1, args.runs_per_level+1):
+                    random.shuffle(urls)
+                    for url in tqdm(urls, desc=f"{args.mode} {lvl}% rep {rep}/{args.runs_per_level}"):
+                        tag = f"{args.mode}{lvl}_rep{rep}_{url.replace('://','_').replace('/','_')}_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+                        pcap, nav = capture_one(args.ns, url, tag, args.headless, chrome)
+                        w.writerow({"mode":args.mode,"level":lvl,"url":url,"rep":rep,"pcap":pcap,
+                                    "plt_ms":nav["plt_ms"],"t_wall_start":nav["t_wall_start"],"t_wall_end":nav["t_wall_end"]}); f.flush()
+            set_loader(args.ns, "off", ifname)
+
+        else: # dynamic mode
+            print("[INFO] Starting dynamic mode measurements")
+            set_loader(args.ns, "dynamic", ifname,
+                           dyn_max=args.dynamic_max_prob, 
+                           dyn_min_pps=args.dynamic_min_pps, 
+                           dyn_max_pps=args.dynamic_max_pps)
+            
+            for rep in range(1, args.runs_per_level+1):
+                random.shuffle(urls)
+                for url in tqdm(urls, desc=f"dynamic rep {rep}/{args.runs_per_level}"):
+                    tag = f"dyn_rep{rep}_{url.replace('://','_').replace('/','_')}_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+                    pcap, nav = capture_one(args.ns, url, tag, args.headless, chrome)
+                    w.writerow({"mode":"dynamic","level":-1,"url":url,"rep":rep,"pcap":pcap,
+                                "plt_ms":nav["plt_ms"],"t_wall_start":nav["t_wall_start"],"t_wall_end":nav["t_wall_end"],
+                                "dyn_max_prob":args.dynamic_max_prob,"dyn_min_pps":args.dynamic_min_pps,"dyn_max_pps":args.dynamic_max_pps}); f.flush()
+            set_loader(args.ns, "off", ifname)
+
+if __name__ == "__main__":
+    main()#!/usr/bin/env python3
+"""
+Web Flow Evaluation Tool - Core Measurement Script
+
+***
+This script accepts a command-line argument for the output directory.
+Usage:
+  python3 run_measurements.py --mode fixed ... --out-dir [MY_DIR]
+***
+"""
+
+import os, csv, time, shlex, signal, tempfile, random, argparse, atexit, shutil, re, subprocess
+from pathlib import Path
+from datetime import datetime
+from contextlib import contextmanager
+from tqdm import tqdm
+
+# --- 1. 命令行参数解析 ---
+# (我们将在这里定义 argparse，以便全局常量可以使用它)
+
+parser = argparse.ArgumentParser(description="QUIC WF eval runner (Selenium + tcpdump + eBPF loader)")
+
+# --- 2. 动态设置路径 ---
+parser.add_argument("--out-dir", default="out",
+                    help="Output directory for all measurement results (default: 'out')")
+parser.add_argument("--ns", default="wfns", 
+                    help="Network namespace name for traffic isolation")
+parser.add_argument("--urls", default="urls.txt", 
+                    help="File containing list of URLs to test")
+parser.add_argument("--mode", choices=["off","fixed","dynamic","dummy"], required=True,
+                    help="Packet dropping/generation mode")
+# (其他参数将在 main 函数中添加)
+
+# --- 3. 解析 *已知* 的参数 (只为了获取 out-dir) ---
+# 我们使用 parse_known_args()，这样 main 函数中的完整解析器也不会出错
+cli_args, _ = parser.parse_known_args()
+
+# --- 4. 定义全局路径 (现在是动态的) ---
+NS_DEFAULT = cli_args.ns
+OUT_DIR    = Path(cli_args.out_dir) # <-- 关键修复
+PCAPS_DIR  = OUT_DIR / "pcaps"
+CSV_PATH   = OUT_DIR / "nav_metrics.csv"
+EBPF_DIR   = Path("ebpf")
+LOADER_BIN = EBPF_DIR / "loader"
+
+# --- Shell Command Utilities (保持不变) ---
+def sh(cmd: str):
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+def ns_sh(ns: str, cmd: str):
+    return sh(f"ip netns exec {shlex.quote(ns)} sh -lc {shlex.quote(cmd)}")
+
+def run_in_ns(ns: str, cmd: str, env=None):
+    return subprocess.Popen(f"ip netns exec {shlex.quote(ns)} {cmd}", shell=True, env=env, preexec_fn=os.setsid)
+
+# --- Namespace Management (保持不变) ---
+def clean_namespace(ns: str):
+    print(f"[INFO] Cleaning namespace {ns}...")
+    patterns = ["chrome.*--enable-quic", "chromedriver", "tcpdump.*veth1"]
+    for pattern in patterns:
+        ns_sh(ns, f"pkill -f '{pattern}' 2>/dev/null || true")
+    time.sleep(0.5)
+    print(f"[SUCCESS] Namespace {ns} cleaned")
+
+# --- Traffic Control (保持不变) ---
+def setup_traffic_control():
+    print("[INFO] Setting up traffic control...")
+    wan_if = sh("ip route get 1.1.1.1 | awk '/dev/ {print $5; exit}'").stdout.strip()
+    if not wan_if:
+        print("[WARNING] Could not detect WAN interface, skipping traffic control")
+        return None
+    
+    print(f"[INFO] Applying traffic control on interface: {wan_if}")
+    commands = [
+        f"tc qdisc add dev {wan_if} root handle 1: htb default 30",
+        f"tc class add dev {wan_if} parent 1: classid 1:1 htb rate 100mbit",
+        f"tc class add dev {wan_if} parent 1:1 classid 1:10 htb rate 90mbit ceil 95mbit",  
+        f"tc class add dev {wan_if} parent 1:1 classid 1:30 htb rate 10mbit ceil 20mbit",  
+        f"tc filter add dev {wan_if} parent 1: protocol ip prio 1 u32 match ip src 10.200.0.0/24 classid 1:10",
+        f"tc filter add dev {wan_if} parent 1: protocol ip prio 2 u32 match ip src 0.0.0.0/0 classid 1:30"
+    ]
+    for cmd in commands:
+        result = sh(f"sudo {cmd}")
+        if result.returncode != 0:
+            print(f"[ERROR] Traffic control setup failed: {cmd}")
+            cleanup_traffic_control()
+            return None
+    
+    print("[SUCCESS] Traffic control active")
+    return wan_if
+
+def cleanup_traffic_control():
+    wan_if = sh("ip route get 1.1.1.1 | awk '/dev/ {print $5; exit}'").stdout.strip()
+    if wan_if:
+        print(f"[INFO] Removing traffic control from {wan_if}")
+        sh(f"sudo tc qdisc del dev {wan_if} root 2>/dev/null || true")
+        print("[SUCCESS] Traffic control removed")
+
+# --- Chrome Management (保持不变) ---
+def pick_chrome_binary():
+    for p in ("/usr/bin/google-chrome","/usr/bin/google-chrome-stable","/usr/bin/chromium",
+              "/usr/lib/chromium-browser/chromium-browser","/usr/bin/chromium-browser","/snap/bin/chromium"):
+        if os.path.exists(p) and os.access(p, os.X_OK):
+            try:
+                if "/snap/" in os.path.realpath(p):  
+                    continue
+            except Exception: pass
+            return p
+    return "/snap/bin/chromium"
+
+def get_chrome_major(ns: str, chrome_bin: str):
+    out = ns_sh(ns, f"{shlex.quote(chrome_bin)} --version || true").stdout.strip()
+    m = re.search(r"\b(\d+)\.", out)
+    return int(m.group(1)) if m else None
+
+def find_chromedriver_for_major(major: int):
+    for p in ("/usr/bin/chromedriver","/usr/lib/chromium-browser/chromedriver",
+              "/usr/lib/chromium/chromedriver","/usr/local/bin/chromedriver"):
+        if os.path.exists(p) and os.access(p, os.X_OK):
+            try:
+                out = subprocess.run([p,"--version"], capture_output=True, text=True).stdout
+                m = re.search(r"\b(\d+)\.", out)
+                if int(m.group(1)) == major:
+                    return p
+            except Exception: pass
+    return None
+
+@contextmanager
+def ns_wrapper(target_bin: str, ns: str):
+    fd, path = tempfile.mkstemp(prefix="nswrap-", suffix=".sh")
+    try:
+        os.write(fd, f"#!/bin/sh\nexec ip netns exec {shlex.quote(ns)} {shlex.quote(target_bin)} \"$@\"\n".encode())
+        os.fsync(fd); os.fchmod(fd, 0o755)
+    finally:
+        os.close(fd)
+    try:
+        yield path
+    finally:
+        try: os.unlink(path)
+        except Exception: pass
+
+# --- QUIC-Only Firewall (保持不变) ---
+def quic_only_install(ns: str):
+    script = r"""
+add table inet quiconly 2>/dev/null
+add chain inet quiconly out { type filter hook output priority 0; policy accept; } 2>/dev/null
+add rule inet quiconly out udp dport 443 accept 2>/dev/null
+add rule inet quiconly out tcp dport 443 reject 2>/dev/null
+"""
+    ns_sh(ns, "nft -f - <<'EOF'\n" + script + "EOF")
+
+def quic_only_uninstall(ns: str):
+    ns_sh(ns, "nft delete table inet quiconly 2>/dev/null || true")
+
+# --- eBPF Loader (保持不变) ---
+_loader_proc = None 
+def set_loader(ns: str, mode: str, ifname: str, *, fixed_prob=None, dyn_max=None, dyn_min_pps=None, dyn_max_pps=None):
+    global _loader_proc
+    if _loader_proc and _loader_proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(_loader_proc.pid), signal.SIGINT)
+            _loader_proc.wait(timeout=3)
+        except Exception:
+            try: os.killpg(os.getpgid(_loader_proc.pid), signal.SIGTERM)
+            except Exception: pass
+    _loader_proc = None
+    
+    if mode == "off":
+        return
+    if not LOADER_BIN.exists():
+        raise SystemExit("ERROR: build the loader first:  (cd ebpf && make)")
+    
+    if mode == "fixed" or mode == "ingress":
+        cmd = f"{shlex.quote(str(LOADER_BIN))} {shlex.quote(ifname)} --mode fixed --prob {int(fixed_prob)}"
+    elif mode == "dummy":
+        cmd = f"{shlex.quote(str(LOADER_BIN))} {shlex.quote(ifname)} --mode dummy --prob {int(fixed_prob)}"
+    elif mode == "dynamic":
+        cmd = (f"{shlex.quote(str(LOADER_BIN))} {shlex.quote(ifname)} --mode dynamic "
+               f"--max-prob {int(dyn_max)} --min-rate {int(dyn_min_pps)} --max-rate {int(dyn_max_pps)}")
+    else:
+        raise ValueError(f"Unknown eBPF mode: {mode}")
+    
+    _loader_proc = run_in_ns(ns, cmd)
+    time.sleep(3)  
+    if _loader_proc.poll() is not None:
+        raise SystemExit(f"[ERROR] Loader process failed to start (exit code: {_loader_proc.poll()})")
+atexit.register(lambda: set_loader(NS_DEFAULT, "off", "lo"))
+
+# --- Network Diagnostics (保持不变) ---
+def autodetect_iface(ns: str):
+    p = ns_sh(ns, "ip -o -4 route show default | awk '{print $5}'")
+    if p.returncode == 0 and p.stdout.strip():
+        return p.stdout.strip()
+    p = ns_sh(ns, "ip -o link show | awk -F': ' '$2!~/lo/ {print $2; exit}'")
+    return p.stdout.strip() or "eth0"
+# (ns_has_udp443, ns_diag... 保持不变)
+
+# --- Web Navigation (保持不变) ---
+def measure_nav(ns: str, chrome_bin: str, url: str, headless: bool):
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+
+    major = get_chrome_major(ns, chrome_bin)
+    if not major:
+        raise SystemExit(f"Chrome not found/unreadable in {ns}: {chrome_bin}")
+    cdrv = find_chromedriver_for_major(major)
+    if not cdrv:
+        raise SystemExit(f"chromedriver {major}.x not found. Install one aligned with Chrome {major}.x")
+
+    with ns_wrapper(chrome_bin, ns) as chrome_in_ns:
+        opts = Options()
+        for a in ("--no-first-run","--disable-extensions","--disable-background-networking",
+                  "--disable-sync","--incognito","--disk-cache-size=1",
+                  "--disable-application-cache","--disable-back-forward-cache",
+                  "--disable-background-timer-throttling","--disable-renderer-backgrounding",
+                  "--disable-features=TranslateUI,BlinkGenPropertyTrees",
+                  "--enable-quic","--enable-features=UseDnsHttpsSvcb,UseDnsHttpsSvcbAlpn",
+                  "--no-sandbox","--disable-dev-shm-usage","--remote-debugging-pipe"):
+            opts.add_argument(a)
+        
+        if headless:
+            opts.add_argument("--headless=new")
+            opts.add_argument("--hide-scrollbars") 
+            opts.add_argument("--disable-gpu")
+            
+        profile = tempfile.mkdtemp(prefix="chrome-prof-")
+        opts.add_argument(f"--user-data-dir={profile}")
+        opts.binary_location = chrome_in_ns
+        
+        drv = webdriver.Chrome(service=Service(executable_path=cdrv), options=opts)
+
+        try:
+            drv.set_page_load_timeout(120)
+            drv.execute_cdp_cmd('Network.setCacheDisabled', {'cacheDisabled': True})
+            drv.execute_cdp_cmd('Network.clearBrowserCache', {})
+            
+            t0 = time.time()
+            drv.get(url)
+            
+            for _ in range(450):
+                if drv.execute_script("return document.readyState") == "complete":
+                    break
+                time.sleep(0.1)
+            
+            nav = drv.execute_script("return performance.getEntriesByType('navigation')[0] || {}")
+            plt_ms = (nav.get("loadEventEnd", 0) - nav.get("startTime", 0)) or 0
+            time.sleep(5)
+            return {"plt_ms": plt_ms, "t_wall_start": t0, "t_wall_end": time.time()}
+        except KeyboardInterrupt:
+            print(f"[INFO] Navigation interrupted by user for {url}")
+            return {"plt_ms": 0, "t_wall_start": t0, "t_wall_end": time.time()}
+        except Exception as e:
+            print(f"[ERROR] Navigation failed for {url}: {e}")
+            return {"plt_ms": 0, "t_wall_start": t0, "t_wall_end": time.time()}
+        finally:
+            drv.quit()
+            shutil.rmtree(profile, ignore_errors=True)
+
+# --- Capture Functions (保持不变) ---
+@contextmanager
+def tcpdump_veth1(ns: str, outfile: Path, bpf: str):
+    proc = run_in_ns(ns, f"tcpdump -i veth1 -w {shlex.quote(str(outfile))} -U -n {shlex.quote(bpf)}")
+    time.sleep(0.6)
+    try:
+        yield
+    finally:
+        try: os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+        except Exception: pass
+        try: proc.wait(timeout=5)
+        except Exception: pass
+
+def capture_one(ns: str, url: str, tag: str, headless: bool, chrome_bin: str):
+    # pcap 路径现在使用全局的 PCAPS_DIR (它是由 --out-dir 决定的)
+    pcap = PCAPS_DIR / f"{tag}.pcap"
+    nav = {}
+    
+    with tcpdump_veth1(ns, pcap, "udp and port 443"):
+        nav = measure_nav(ns, chrome_bin, url, headless)
+    
+    try:
+        ci = ns_sh(ns, f"capinfos -c {shlex.quote(str(pcap))} 2>/dev/null | awk -F': ' '/Number of packets/ {{print $2}}'").stdout.strip()
+        pkt = int(ci) if ci.isdigit() else (pcap.stat().st_size > 24)
+    except Exception:
+        pkt = (pcap.stat().st_size > 24)
+
+    if not pkt:
+        print(f"[warn] empty pcap for {url}. The site may not use QUIC.")
+        
+    # --- 关键修复：返回 *相对* 路径 ---
+    # 我们返回相对于项目根目录的路径，这样 analyse_pcaps.py 才能找到它
+    return str(pcap), nav or {"plt_ms":0,"t_wall_start":0,"t_wall_end":0}
+
+
+# --- Main Execution Logic ---
+def main():
+    # --- 5. 添加剩余的参数 ---
+    # (注意：--out-dir, --ns, --urls, --mode 已经在脚本顶部添加了)
+    parser.add_argument("--levels", default="0,1,2,5,10", 
+                        help="Comma-separated drop/clone percentages for fixed/dummy mode")
+    parser.add_argument("--runs-per-level", type=int, default=10,
+                        help="Number of measurement repetitions per drop level")
+    parser.add_argument("--dynamic-max-prob", type=int, default=50,
+                        help="Maximum drop percentage in dynamic mode")
+    parser.add_argument("--dynamic-min-pps", type=int, default=1000,
+                        help="Minimum packets/sec for dynamic dropping activation")
+    parser.add_argument("--dynamic-max-pps", type=int, default=100000,
+                        help="Maximum packets/sec for full dynamic drop rate")
+    parser.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True,
+                        help="Run Chrome in headless mode (no GUI)")
+    parser.add_argument("--quic-only", action=argparse.BooleanOptionalAction, default=True,
+                        help="Install firewall rules to force QUIC protocol usage")
+    parser.add_argument("--traffic-control", action=argparse.BooleanOptionalAction, default=True, 
+                        help="Enable traffic control to isolate experiment traffic from host interference")
+    
+    # --- 6. 完整解析参数 ---
+    args = parser.parse_args()
+    
+    # --- Environment Setup (使用全局路径) ---
+    print(f"[SETUP] Using output directory: {OUT_DIR.resolve()}")
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    PCAPS_DIR.mkdir(parents=True, exist_ok=True) # <-- 确保 pcaps 目录也被创建
+
+    test_ns = subprocess.run(["ip", "netns", "exec", args.ns, "true"], capture_output=True)
+    if test_ns.returncode != 0:
+        raise SystemExit(f"Permission denied to enter namespace '{args.ns}'. Run with sudo -E.")
+
+    chrome = pick_chrome_binary()
+    if args.quic_only:
+        quic_only_install(args.ns)
+        atexit.register(lambda: quic_only_uninstall(args.ns))
+    
+    clean_namespace(args.ns)
+    
+    if args.traffic_control:
+        tc_interface = setup_traffic_control()
+        if tc_interface:
+            atexit.register(cleanup_traffic_control)
+    
+    ifname = autodetect_iface(args.ns)
+    print(f"[preflight] ns={args.ns} if={ifname} chrome={chrome} major={get_chrome_major(args.ns, chrome)}")
+    print("[preflight] ping 1.1.1.1 ->", ns_sh(args.ns, "ping -c1 -W1 1.1.1.1 >/dev/null && echo OK || echo FAIL").stdout.strip())
+
+    urls = [u.strip() for u in open(args.urls) if u.strip() and not u.startswith("#")]
+    random.seed(123)
+
+    # --- Measurement Execution (使用全局路径) ---
+    file_exists = CSV_PATH.exists()
+    with open(CSV_PATH, "a" if file_exists else "w", newline="") as f:
+        # (确保 fieldnames 包含 'mode')
+        fieldnames=["mode","level","url","rep","pcap","plt_ms","t_wall_start","t_wall_end",
+                    "dyn_max_prob","dyn_min_pps","dyn_max_pps"]
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            w.writeheader()
+
+        # (模式循环保持不变)
+        if args.mode == "off":
+            print("[INFO] Starting baseline measurements (mode: off)")
+            set_loader(args.ns, "off", ifname)
+            for rep in range(1, args.runs_per_level+1):
+                random.shuffle(urls)
+                for url in tqdm(urls, desc=f"baseline {rep}/{args.runs_per_level}"):
+                    tag = f"off_rep{rep}_{url.replace('://','_').replace('/','_')}_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+                    pcap, nav = capture_one(args.ns, url, tag, args.headless, chrome)
+                    w.writerow({"mode":"off","level":0,"url":url,"rep":rep,"pcap":pcap,
+                                "plt_ms":nav["plt_ms"],"t_wall_start":nav["t_wall_start"],"t_wall_end":nav["t_wall_end"]}); f.flush()
+
+        elif args.mode == "fixed" or args.mode == "dummy":
+            levels = [int(x) for x in args.levels.split(",") if x.strip()]
+            for lvl in levels:
+                print(f"[INFO] Starting {args.mode} mode measurements at level {lvl}%")
+                set_loader(args.ns, args.mode, ifname, fixed_prob=lvl)
+                
+                for rep in range(1, args.runs_per_level+1):
+                    random.shuffle(urls)
+                    for url in tqdm(urls, desc=f"{args.mode} {lvl}% rep {rep}/{args.runs_per_level}"):
+                        tag = f"{args.mode}{lvl}_rep{rep}_{url.replace('://','_').replace('/','_')}_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+                        pcap, nav = capture_one(args.ns, url, tag, args.headless, chrome)
+                        w.writerow({"mode":args.mode,"level":lvl,"url":url,"rep":rep,"pcap":pcap,
+                                    "plt_ms":nav["plt_ms"],"t_wall_start":nav["t_wall_start"],"t_wall_end":nav["t_wall_end"]}); f.flush()
+            set_loader(args.ns, "off", ifname)
+
+        else: # dynamic mode
+            print("[INFO] Starting dynamic mode measurements")
+            set_loader(args.ns, "dynamic", ifname,
+                           dyn_max=args.dynamic_max_prob, 
+                           dyn_min_pps=args.dynamic_min_pps, 
+                           dyn_max_pps=args.dynamic_max_pps)
+            
+            for rep in range(1, args.runs_per_level+1):
+                random.shuffle(urls)
+                for url in tqdm(urls, desc=f"dynamic rep {rep}/{args.runs_per_level}"):
+                    tag = f"dyn_rep{rep}_{url.replace('://','_').replace('/','_')}_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+                    pcap, nav = capture_one(args.ns, url, tag, args.headless, chrome)
+                    w.writerow({"mode":"dynamic","level":-1,"url":url,"rep":rep,"pcap":pcap,
+                                "plt_ms":nav["plt_ms"],"t_wall_start":nav["t_wall_start"],"t_wall_end":nav["t_wall_end"],
+                                "dyn_max_prob":args.dynamic_max_prob,"dyn_min_pps":args.dynamic_min_pps,"dyn_max_pps":args.dynamic_max_pps}); f.flush()
+            set_loader(args.ns, "off", ifname)
+
+if __name__ == "__main__":
+    main()

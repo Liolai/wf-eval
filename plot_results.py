@@ -1,223 +1,288 @@
 #!/usr/bin/env python3
+"""
+plot_results.py (Final Polished Version)
+
+Features:
+1. FILTERS: Only shows Baseline, 5%, and 20% for Dummy/Fixed (Cleaner).
+2. ZOOMED TRADEOFF: Cuts off the extreme outliers to focus on the relevant area (0-100% Cost).
+3. DEBUGGING: Prints what data is actually found to diagnose missing Ingress bars.
+"""
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
+from scipy.stats import ks_2samp
 
+# --- 1. Setup ---
 OUT = Path("out")
-PLOTS = OUT / "plots"  # Use out/plot directory
+PLOTS = OUT / "plots"
 PLOTS.mkdir(parents=True, exist_ok=True)
 
-# --- 1. 加载数据 ---
+plt.rcParams.update({
+    'font.size': 14,
+    'axes.titlesize': 16,
+    'axes.labelsize': 14,
+    'legend.fontsize': 12,
+    'figure.titlesize': 18,
+    'font.family': 'serif',
+    'figure.figsize': (8, 6),
+    'lines.linewidth': 2.5
+})
+
+# --- 2. Load Data ---
+print("Loading CSV data...")
 try:
     summary = pd.read_csv(OUT / "summary.csv")
     iat_up = pd.read_csv(OUT / "iat_up.csv")
     iat_down = pd.read_csv(OUT / "iat_down.csv")
-except FileNotFoundError as e:
-    print(f"Error: {e}.")
-    print("Please run analyse_pcaps.py first.")
+    
+    # Debugging: Print found modes to verify Ingress data existence
+    print(f"DEBUG: Modes found in summary.csv: {summary['mode'].unique()}")
+    if 'ingress' in summary['mode'].unique():
+        print(f"DEBUG: Ingress levels found: {summary[summary['mode']=='ingress']['level'].unique()}")
+    else:
+        print("WARNING: No 'ingress' data found in CSV!")
+
+except FileNotFoundError:
+    print("Error: CSV files not found. Run analyse_pcaps.py first.")
     exit(1)
 
-# --- 2. 关键修复：创建一个“组合标签”列 ---
-def create_label(df):
-    if 'mode' not in df.columns:
-        print("Error: 'mode' column not found in CSV. Did analyse_pcaps.py run correctly?")
-        return df # 返回原始df以避免崩溃
-
-    # 填充 'off' 模式可能缺失的 'mode'
-    df['mode'] = df['mode'].fillna('off')
+# --- 3. Data Cleaning & Filtering ---
+def clean_labels_and_filter(df):
+    """
+    1. Creates clean labels.
+    2. FILTERS out levels 1, 2, 10 for Dummy/Fixed (keeps 0, 5, 20).
+    """
+    if 'mode' not in df.columns: return df
     
-    # 将 level 转换为字符串
-    label = df['level'].astype(str)
+    # Ensure types
+    df['mode'] = df['mode'].fillna('off').astype(str)
+    df['level'] = df['level'].fillna(0).astype(int)
     
-    # 定义条件
-    is_off = (df['mode'] == 'off')
-    is_dynamic = (df['mode'] == 'dynamic')
-    is_fixed = (df['mode'] == 'fixed')
-    is_dummy = (df['mode'] == 'dummy') # <-- (这里是修正点)
-
-    # 应用新标签
-    label[is_off] = "0% (Baseline)"
-    label[is_dynamic] = "Dynamic"
-    label[is_fixed] = label[is_fixed].str.replace(r'\.0$', '', regex=True) + "% (Fixed)"
-    label[is_dummy] = label[is_dummy].str.replace(r'\.0$', '', regex=True) + "% (Dummy)"
+    # FILTER: Keep only Baseline (0), 5%, 20%, or Dynamic
+    # We allow Ingress to keep all its levels for now to see what we have
+    keep_levels = [0, 5, 20]
     
-    df['label'] = label
-    return df
-
-summary = create_label(summary)
-iat_up = create_label(iat_up)
-iat_down = create_label(iat_down)
-
-# Debug: 打印新的标签信息
-print(f"Summary data shape: {summary.shape}")
-print(f"Labels found: {sorted(summary['label'].unique())}")
-print(f"Label counts: {summary['label'].value_counts().sort_index()}")
-print(f"Metrics available: {list(summary.columns)}")
-print()
-
-def format_value_with_unit(value, unit):
-    """Format values with appropriate unit conversion for readability"""
-    if unit == "bytes":
-        if value >= 1024*1024:
-            return f"{value/(1024*1024):.1f}", "MB"
-        elif value >= 1024:
-            return f"{value/1024:.1f}", "KB" 
+    # Create a mask for filtering
+    # Logic: Keep if (mode is dynamic) OR (mode is ingress) OR (level is in [0, 5, 20])
+    mask = (df['mode'] == 'dynamic') | (df['mode'] == 'ingress') | (df['level'].isin(keep_levels))
+    df = df[mask].copy()
+    
+    labels = []
+    sort_keys = []
+    
+    for _, row in df.iterrows():
+        m = row['mode']
+        l = row['level']
+        
+        if m == 'off':
+            labels.append("Baseline")
+            sort_keys.append(0)
+        elif m == 'dynamic':
+            labels.append("Dynamic")
+            sort_keys.append(999)
+        elif m == 'fixed':
+            labels.append(f"{l}% Fixed")
+            sort_keys.append(l)
+        elif m == 'dummy':
+            labels.append(f"{l}% Dummy")
+            sort_keys.append(l + 1000)
+        elif m == 'ingress':
+            labels.append(f"{l}% Ingress")
+            sort_keys.append(l + 2000)
         else:
-            return f"{value:.0f}", "bytes"
-    elif unit == "ms" and value >= 1000:
-        return f"{value/1000:.2f}", "seconds"
+            labels.append(f"{m} {l}")
+            sort_keys.append(9999)
+            
+    df['label'] = labels
+    df['sort_key'] = sort_keys
+    return df.sort_values('sort_key')
+
+summary = clean_labels_and_filter(summary)
+iat_up = clean_labels_and_filter(iat_up)
+iat_down = clean_labels_and_filter(iat_down)
+
+# --- 4. Plotting Functions ---
+
+def get_98th_percentile(df, labels):
+    all_values = []
+    for label in labels:
+        vals = df[df['label'] == label]['iat_s'].dropna().values
+        all_values.extend(vals)
+    if not all_values: return 1.0
+    return np.percentile(all_values, 98) * 1000
+
+def plot_performance_bar(df, mode_filter, filename, title):
+    """Generates bar charts."""
+    if mode_filter == 'dummy':
+        subset = df[(df['mode'] == 'off') | (df['mode'] == 'dummy')]
+    elif mode_filter == 'fixed':
+        subset = df[(df['mode'] == 'off') | (df['mode'] == 'fixed')]
+    elif mode_filter == 'ingress':
+        subset = df[(df['mode'] == 'off') | (df['mode'] == 'ingress')]
     else:
-        return f"{value:.1f}", unit
-
-def agg_bar_ci(df, metric, fname, title, ylabel=None, unit=""):
-    """Create bar chart with confidence intervals and professional styling"""
-    
-    # --- 修复 3: 按新的 'label' 列分组 ---
-    g = df.groupby("label")[metric].agg(['mean','count','std']).reset_index()
-    g['sem'] = g['std'] / np.sqrt(g['count'])
-    g['ci95'] = 1.96 * g['sem']
-    
-    # --- 修复 4: 动态创建排序顺序 ---
-    all_labels = sorted(df['label'].unique())
-    level_order = ['0% (Baseline)']
-    # 智能排序：1%, 1% (dummy), 10%, 10% (dummy), 2%, 2% (dummy)...
-    other_labels = sorted([l for l in all_labels if l not in level_order and l != 'Dynamic'], 
-                          key=lambda x: (int(x.split('%')[0]), x))
-    level_order.extend(other_labels)
-    if "Dynamic" in all_labels:
-        level_order.append("Dynamic")
-
-    g['label'] = pd.Categorical(g['label'], categories=level_order, ordered=True)
-    g = g.sort_values('label').dropna(subset=['label']) # 丢弃任何意外的标签
-
-    plt.figure(figsize=(12, 7)) # 增加宽度以容纳更多条
-    bars = plt.bar(g['label'].astype(str), g['mean'], yerr=g['ci95'], capsize=4, 
-                   color='steelblue', alpha=0.7, edgecolor='navy', linewidth=0.8)
-    
-    # --- 修复 5: 更新X轴标签 ---
-    plt.xlabel("Experiment Mode and Level", fontsize=12, fontweight='bold')
-    plt.xticks(rotation=45, ha='right') # 旋转标签以防重叠
-    
-    # (Y轴标签逻辑保持不变)
-    y_label = ylabel if ylabel else metric
-    if unit:
-        if unit == "bytes":
-            max_val = g['mean'].max()
-            if max_val >= 1024*1024:
-                y_label += " (MB)"
-                g['mean'] = g['mean'] / (1024*1024)
-                g['ci95'] = g['ci95'] / (1024*1024)
-            elif max_val >= 1024:
-                y_label += " (KB)"  
-                g['mean'] = g['mean'] / 1024
-                g['ci95'] = g['ci95'] / 1024
-            else:
-                y_label += " (bytes)"
-        else:
-            y_label += f" ({unit})"
-    
-    plt.ylabel(y_label, fontsize=12, fontweight='bold')
-    plt.title(title, fontsize=14, fontweight='bold', pad=20)
-    
-    # (在条形图上显示值的逻辑保持不变)
-    for i, (idx, row) in enumerate(g.iterrows()):
-        formatted_val, display_unit = format_value_with_unit(row['mean'], unit)
-        plt.text(i, row['mean'] + row['ci95'] + max(g['mean']) * 0.02, 
-                 f"{formatted_val}\n(n={int(row['count'])})", 
-                 ha='center', va='bottom', fontsize=9, fontweight='bold')
-    
-    # (样式逻辑保持不变)
-    plt.grid(True, axis='y', alpha=0.3, linestyle='--')
-    plt.gca().spines['top'].set_visible(False)
-    plt.gca().spines['right'].set_visible(False)
-    
-    plt.tight_layout()
-    plt.savefig(PLOTS / fname, dpi=180, bbox_inches='tight')
-    plt.close()
-    
-    # --- 修复 6: 更新调试打印信息 ---
-    print(f"✓ Generated {fname}: {len(g)} labels found: {list(g['label'])}")
-
-def plot_comparative_cdf(df, metric_col, fname, title, xlabel):
-    """Create comparative CDF plot showing all levels on the same chart"""
-    if len(df) == 0:
-        print(f"⚠️  Warning: Empty data for {fname}")
+        subset = df
+        
+    if subset.empty or len(subset['label'].unique()) < 2:
+        print(f"Skipping {filename}: Not enough data (Found: {subset['label'].unique()})")
         return
 
-    plt.figure(figsize=(10, 7))
+    g = subset.groupby("label").agg(
+        plt_mean=('plt_ms', 'mean'),
+        plt_sem=('plt_ms', 'sem'),
+        sort_key=('sort_key', 'first')
+    ).sort_values('sort_key').reset_index()
+    
+    g['ci95'] = 1.96 * g['plt_sem']
+    
+    plt.figure(figsize=(7, 6))
+    bars = plt.bar(g['label'], g['plt_mean'], yerr=g['ci95'], capsize=5, 
+                   color='royalblue', edgecolor='black', alpha=0.8)
+    
+    # Highlight Baseline in Gray
+    for i, label in enumerate(g['label']):
+        if "Baseline" in label:
+            bars[i].set_color('gray')
 
-    # --- 修复 7: 按 'label' 分组和上色 ---
-    all_labels = sorted(df['label'].unique())
-    colors = plt.cm.viridis(np.linspace(0, 1, len(all_labels)))
-    label_colors = dict(zip(all_labels, colors))
-
-    # Plot CDF for each label
-    for label, label_data in df.groupby('label'): # <-- 按 'label' 分组
-        if len(label_data) == 0:
-            continue
-
-        series = label_data[metric_col].dropna()
-        if len(series) == 0:
-            continue
-
-        x = np.sort(series.values)
-        x = x * 1000  # FIX 1: Convert to milliseconds (原脚本中已有)
-        y = np.arange(1, len(x)+1) / len(x)
-
-        # --- 修复 8: 更新图例标签 ---
-        label_text = f"{label} (n={len(series)})" # e.g., "10% (Dummy) (n=12345)"
-        
-        plt.plot(x, y, linewidth=2.5, alpha=0.8, color=label_colors[label],
-                 label=label_text) # <-- 使用新的 label_text
-
-    plt.xlabel("Inter-Arrival Time (ms)", fontsize=12, fontweight='bold') # FIX 2: Update Label (原脚本中已有)
-    plt.ylabel("Cumulative Distribution Function (CDF)", fontsize=12, fontweight='bold')
-    plt.title(title, fontsize=14, fontweight='bold', pad=20)
-
-    # (样式逻辑保持不变)
-    plt.grid(True, which='both', axis='both', alpha=0.3, linestyle='--')
-    plt.gca().spines['top'].set_visible(False)
-    plt.gca().spines['right'].set_visible(False)
-
-    plt.xlim(0, 100) # FIX 3: Zoom in on X-axis (原脚本中已有)
-    plt.xscale('symlog')
-    plt.legend(loc='lower right', frameon=True, fancybox=True, shadow=True)
-
-    plt.savefig(PLOTS / fname, dpi=180, bbox_inches='tight') # FIX 4: (原脚本中已有)
+    plt.title(title)
+    plt.ylabel("Page Load Time (ms)")
+    plt.xlabel("")
+    plt.grid(axis='y', linestyle='--', alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(PLOTS / filename, dpi=300)
     plt.close()
+    print(f"Generated {filename}")
 
-    # --- 修复 9: 更新调试打印信息 ---
-    print(f"✓ Generated comparative {fname}: {len(df['label'].unique())} labels compared")
+def plot_cdf(df, mode_filter, filename, title):
+    """Generates Zoomed CDFs."""
+    if mode_filter == 'dummy':
+        target_modes = ['off', 'dummy']
+    elif mode_filter == 'fixed':
+        target_modes = ['off', 'fixed']
+    elif mode_filter == 'ingress':
+        target_modes = ['off', 'ingress']
+    
+    subset = df[df['mode'].isin(target_modes)].copy()
+    subset = subset.sort_values('sort_key')
+    
+    if subset.empty or len(subset['label'].unique()) < 2: 
+        return
 
-# (主运行逻辑不需要修改，因为它只是调用上面的函数)
-# Generate professional bar charts with clear labels and units
-plot_configs = [
-    ("plt_ms", "bar_plt_ms.png", "Page Load Time vs Packet Loss", "Page Load Time", "ms"),
-    ("bytes_up", "bar_bytes_up.png", "Uplink Traffic vs Packet Loss", "Bytes Transmitted (Uplink)", "bytes"),
-    ("bytes_down", "bar_bytes_down.png", "Downlink Traffic vs Packet Loss", "Bytes Received (Downlink)", "bytes"), 
-    ("pkt_up", "bar_pkt_up.png", "Uplink Packet Count vs Packet Loss", "Packets Transmitted (Uplink)", "packets"),
-    ("pkt_down", "bar_pkt_down.png", "Downlink Packet Count vs Packet Loss", "Packets Received (Downlink)", "packets"),
-    ("duration_s", "bar_duration.png", "Connection Duration vs Packet Loss", "Flow Duration", "seconds"),
-]
+    plt.figure(figsize=(8, 6))
+    unique_labels = subset['label'].unique()
+    x_limit = get_98th_percentile(subset, unique_labels)
+    
+    colors = plt.cm.viridis(np.linspace(0, 0.9, len(unique_labels)))
+    
+    for i, label in enumerate(unique_labels):
+        series = subset[subset['label'] == label]['iat_s'].dropna()
+        if series.empty: continue
+        
+        sorted_data = np.sort(series.values) * 1000
+        yvals = np.arange(1, len(sorted_data) + 1) / len(sorted_data)
+        
+        style = '--' if "Baseline" in label else '-'
+        color = 'black' if "Baseline" in label else colors[i]
+        width = 2 if "Baseline" in label else 3
+        
+        plt.plot(sorted_data, yvals, label=label, linestyle=style, color=color, linewidth=width)
 
-print("Generating bar charts with professional styling...")
-for metric, filename, title, ylabel, unit in plot_configs:
-    if metric in summary.columns:
-        agg_bar_ci(summary, metric, filename, title, ylabel, unit)
-    else:
-        print(f"⚠️  Warning: Metric '{metric}' not found in data")
+    plt.title(title)
+    plt.xlabel("Inter-Arrival Time (ms)")
+    plt.ylabel("CDF")
+    plt.xscale('symlog', linthresh=0.1)
+    plt.xlim(0, x_limit) 
+    plt.grid(True, linestyle='--', alpha=0.4)
+    plt.legend(loc='lower right')
+    plt.tight_layout()
+    plt.savefig(PLOTS / filename, dpi=300)
+    plt.close()
+    print(f"Generated {filename}")
 
-# Generate Comparative Inter-Arrival Time CDFs
-print("\nGenerating Comparative Inter-Arrival Time CDFs...")
+def plot_tradeoff_zoomed(summary_df, iat_df):
+    """Trade-off plot ZOOMED in (cutting out extreme outliers)."""
+    results = []
+    base_sum = summary_df[summary_df['mode'] == 'off']
+    base_iat = iat_df[iat_df['mode'] == 'off']['iat_s'].dropna()
+    
+    if base_sum.empty or base_iat.empty: return
+    base_plt = base_sum['plt_ms'].mean()
+    
+    for mode in ['fixed', 'dummy', 'ingress', 'dynamic']:
+        # Note: We use the original summary_df here to calculate all points, 
+        # but we will limit the axis view
+        mode_data = summary_df[summary_df['mode'] == mode]
+        levels = mode_data['level'].unique()
+        
+        for lvl in levels:
+            curr_sum = mode_data[mode_data['level'] == lvl]
+            if curr_sum.empty: continue
+            
+            # Cost: % Increase
+            cost = ((curr_sum['plt_ms'].mean() - base_plt) / base_plt) * 100
+            
+            # Benefit: KS Distance
+            curr_iat = iat_df[(iat_df['mode'] == mode) & (iat_df['level'] == lvl)]['iat_s'].dropna()
+            if curr_iat.empty: continue
+            benefit = ks_2samp(base_iat, curr_iat).statistic
+            
+            results.append({
+                'label': f"{lvl}%",
+                'mode': mode,
+                'cost': cost,
+                'benefit': benefit
+            })
+            
+    res_df = pd.DataFrame(results)
+    
+    plt.figure(figsize=(9, 7))
+    colors = {'fixed': 'red', 'dummy': 'green', 'ingress': 'orange', 'dynamic': 'purple'}
+    markers = {'fixed': 'o', 'dummy': 's', 'ingress': '^', 'dynamic': 'D'}
+    
+    for mode in res_df['mode'].unique():
+        subset = res_df[res_df['mode'] == mode]
+        plt.scatter(subset['benefit'], subset['cost'], 
+                    color=colors.get(mode, 'gray'),
+                    marker=markers.get(mode, 'o'),
+                    s=150, alpha=0.8, label=mode.capitalize())
+        
+        for _, row in subset.iterrows():
+            plt.annotate(row['label'], (row['benefit'], row['cost']), 
+                         xytext=(5, 5), textcoords='offset points', fontsize=11, fontweight='bold')
 
-# IAT data already has level information - no need to merge
-plot_comparative_cdf(iat_up, "iat_s", "cdf_iat_uplink_comparative.png",
-                     "Comparative Inter-Arrival Time Distribution - Upload Traffic",
-                     "Inter-Arrival Time (ms)")
+    plt.title("Trade-off: Performance Cost vs. Benefit (Zoomed)")
+    plt.xlabel("Benefit (KS Distance)")
+    plt.ylabel("Cost (% PLT Increase)")
+    
+    # --- ZOOM SETTINGS ---
+    plt.xlim(-0.01, 0.25)   # X-axis limit
+    plt.ylim(-5, 100)       # Y-axis limit (Cuts off the >100% outliers)
+    # ---------------------
+    
+    plt.axhline(0, color='black', lw=0.8)
+    plt.axvline(0, color='black', lw=0.8)
+    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.legend(loc='upper left')
+    plt.tight_layout()
+    plt.savefig(PLOTS / "final_tradeoff_zoomed.png", dpi=300)
+    plt.close()
+    print("Generated final_tradeoff_zoomed.png")
 
-plot_comparative_cdf(iat_down, "iat_s", "cdf_iat_downlink_comparative.png", 
-                     "Comparative Inter-Arrival Time Distribution - Download Traffic",
-                     "Inter-Arrival Time (ms)")
+# --- 5. Execution ---
+print("--- Generating Final Plots ---")
 
-print("\nAll plots generated successfully in out/plots/")
+# Performance Bars (Filtered 0, 5, 20)
+plot_performance_bar(summary, 'dummy', "bar_perf_dummy.png", "Performance Cost: Dummy Strategy")
+plot_performance_bar(summary, 'fixed', "bar_perf_fixed.png", "Performance Cost: Fixed Drop Strategy")
+plot_performance_bar(summary, 'ingress', "bar_perf_ingress.png", "Performance Cost: Ingress Drop Strategy")
+
+# CDFs (Filtered 0, 5, 20 + Zoomed)
+plot_cdf(iat_up, 'dummy', "cdf_iat_dummy.png", "Traffic Obfuscation: Dummy Strategy")
+plot_cdf(iat_up, 'fixed', "cdf_iat_fixed.png", "Traffic Obfuscation: Fixed Drop Strategy")
+plot_cdf(iat_up, 'ingress', "cdf_iat_ingress.png", "Traffic Obfuscation: Ingress Drop Strategy")
+
+# Trade-off (Zoomed)
+plot_tradeoff_zoomed(summary, iat_up)
+
+print("\nDone! Check out/plots/ folder.")
