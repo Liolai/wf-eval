@@ -1,212 +1,102 @@
-# Web Flow Evaluation Tool (wf-eval)
+# eBPF-based Website Fingerprinting Defense for QUIC
 
-This project evaluates packet dropping defenses against website fingerprinting attacks, measuring both their effectiveness at traffic pattern obfuscation and their impact on web performance using eBPF-based packet manipulation, automated browser measurement, and statistical analysis.
+This project evaluates an eBPF-based packet manipulation defense against website fingerprinting (WF) attacks on QUIC traffic. It measures both the effectiveness of traffic pattern obfuscation (privacy) and its impact on web performance (usability).
 
-The framework evaluates two critical aspects: (1) how effectively packet dropping alters traffic patterns for privacy protection, and (2) what performance costs this defense imposes on users. It uses eBPF programs for precise packet manipulation, Selenium WebDriver for automated browsing, and network namespaces for traffic isolation.
-
-## Table of Contents
-
-- [🚀 Quick Start Guide](#-quick-start-guide) - Get up and running in 3 steps
-- [📁 Project Structure](#-project-structure) - Overview of components and files
-- [⚙️ Usage Instructions](#️-usage-instructions) - Detailed execution options
-- [📊 Output and Results](#-output-and-results) - Understanding the generated data
-- [🔬 Experimental Design and Methodology](#-experimental-design-and-methodology) - System architecture and methodology
-- [📄 License](#-license)
+The core contribution of this final framework is the **Combined Asymmetric Defense**: it applies a fixed probability packet drop on the ingress channel (downlink) to organically mutate temporal bursts, while simultaneously injecting dynamic dummy packets on the egress channel (uplink) to mask client request patterns.
 
 ---
 
-## 🚀 Quick Start Guide
+## ⚠️ Important Notice Regarding Data (Read First)
 
-**For users who want to run the evaluation immediately:**
+To maintain a clean and lightweight Git repository for handover, **all raw `.pcap` files (which amount to tens of gigabytes) have been intentionally removed** from the `out/pcaps/` directory. 
 
-### 1. Set Execute Permissions
-
-```bash
-# Make all shell scripts executable
-chmod +x install_dependencies.sh
-chmod +x run_full_evaluation.sh
-chmod +x setup_netns.sh
-chmod +x clean_netns.sh
-```
-
-### 2. Install Dependencies
-
-```bash
-# Run the automated installation (Ubuntu 22.04 recommended)
-./install_dependencies.sh
-```
-
-### 3. Run Complete Evaluation
-
-```bash
-# Execute the full evaluation pipeline (45-90 minutes)
-./run_full_evaluation.sh
-```
-
-**What happens during execution:**
-- Sets up isolated network namespace
-- Compiles eBPF programs
-- Runs baseline measurements (no packet drops)
-- Tests fixed drop rates (1%, 2%, 5%, 10%, 20%)
-- Tests dynamic drop rates
-- Analyzes packet captures and generates visualizations
-
-**Results:** Check the `out/` directory for CSV files and plots when complete.
+However, all necessary extracted features and metadata required for plotting and clustering analysis have been successfully preserved in the pre-computed **`out/nav_metrics.csv`** (8.1 MB). 
+👉 **You can directly run the plotting scripts to reproduce the thesis figures without needing to re-run the massive network captures.** If you wish to collect new raw PCAP data, simply re-run the measurement pipeline.
 
 ---
 
-## 📁 Project Structure
+## 📁 Repository Structure
 
-### Core Scripts
+### Core Execution Scripts
+- **`run_batch_measurements.py`** - The core measurement engine using Selenium WebDriver, supporting Round-Robin batching and all defense modes (off, drop, dummy, combined).
+- **`setup_netns.sh`** / **`clean_netns.sh`** - Network namespace setup/cleanup for pristine traffic isolation and Traffic Control (TC) rate limiting.
+- **`analyse_pcaps.py`** - Packet capture analysis that extracts IAT, packet sizes, and generates the CSV metrics.
 
-- **`run_full_evaluation.sh`** - Main orchestration script that runs the complete evaluation pipeline
-- **`install_dependencies.sh`** - Automated dependency installation for Ubuntu 22.04
-- **`setup_netns.sh`** - Network namespace setup for traffic isolation
-- **`clean_netns.sh`** - Network namespace cleanup and process termination
-- **`run_measurements.py`** - Core measurement script using Selenium WebDriver for performance evaluation
-- **`analyse_pcaps.py`** - Packet capture analysis for network metrics and traffic pattern obfuscation analysis
-- **`plot_results.py`** - Statistical analysis and visualization generation for both performance and obfuscation metrics
+### eBPF Components (`ebpf/`)
+- **`packet_dropper.bpf.c`** - eBPF program for selective ingress packet dropping.
+- **`dummy_generator.bpf.c`** - eBPF program for egress dummy packet injection via `bpf_clone_redirect`.
+- **`loader.c`** - User-space orchestrator to attach/detach eBPF programs to the TC hooks.
 
-### Configuration Files
-
-- **`urls.txt`** - List of websites to test (production URLs)
-
-### eBPF Components
-
-- **`ebpf/packet_dropper.bpf.c`** - eBPF program for packet dropping
-- **`ebpf/loader.c`** - User-space program to load and control the eBPF program
-- **`ebpf/Makefile`** - Build configuration for eBPF components
+### Plotting & Analysis
+- **`plot_results.py`**, **`plot_tradeoff.py`**, **`plot_tsne.py`** - Scripts to generate the evaluation figures (Accuracy, PLT, Security-Usability Trade-off) from the CSV data.
 
 ---
 
-## ⚙️ Usage Instructions
+## 🚀 Quick Start & Usage Instructions
 
-**For users who need more control or want to understand individual components:**
+### 1. Environment Setup
+Create a Python virtual environment and install the required dependencies:
 
-### Option A: Automated Execution (Recommended)
+python3 -m venv venv
+source venv/bin/activate
+pip install scapy pandas matplotlib seaborn scikit-learn selenium tqdm
 
-Use the main orchestration script for a complete evaluation:
+Compile the eBPF programs (requires clang, llvm, libbpf-dev):
 
-```bash
-./run_full_evaluation.sh
-```
 
-This handles everything automatically and is suitable for most users.
-
-### Option B: Manual Step-by-Step Execution
-
-For debugging, customization, or educational purposes:
-
-### 1. Network Setup
-
-```bash
-# Create isolated network namespace
-./setup_netns.sh
-```
-
-Creates namespace `wfns` with:
-- Isolated network stack
-- NAT for internet access
-- Custom DNS configuration
-
-### 2. eBPF Compilation
-
-```bash
-# Build eBPF components
-cd ebpf/
+cd ebpf
 make clean && make
 cd ..
-```
+2. Generating Plots from Preserved Data (No capture required)
+To reproduce the figures presented in the thesis using the provided out/nav_metrics.csv data, simply run:
 
-### 3. Run Measurements
+Bash
+# Generate main bar charts and the Trade-off scatter plot
+python3 plot_results.py
+python3 plot_tradeoff.py
 
-```bash
-# Run actual measurements
-python3 run_measurements.py [options]
-```
+# Generate t-SNE dimensionality reduction visualization
+python3 plot_tsne.py
+(All generated plots will be saved inside the out/ or out/plots_thesis/ directory).
 
-**Available options:**
-- `--urls`: URL list file (default: urls.txt)
-- `--ns`: Network namespace (default: wfns)
-- `--mode`: Experiment mode (off/fixed/dynamic)
-- `--levels`: Drop percentages for fixed mode (default: 0,1,2,5,10)
-- `--runs-per-level`: Repetitions per experiment
+3. Running New Measurements (From Scratch)
+If you need to collect new traffic traces, you must set up the namespace and run the batch measurement script.
 
-### 4. Analysis and Visualization
+Step A: Setup Isolated Network
 
-```bash
-# Analyze packet captures
+Bash
+./setup_netns.sh
+Step B: Execute Measurements
+You can use the python script directly to control specific defense modes. Note: sudo is typically required to attach eBPF programs and manipulate network namespaces.
+
+Bash
+# Example 1: Run the Baseline (No defense)
+sudo python3 run_batch_measurements.py --mode off
+
+# Example 2: Run the Combined Asymmetric defense 
+# (Fixes drop at 5%, scales dummy injection at 5, 10, 15, 20%)
+sudo python3 run_batch_measurements.py --mode combined --combined-drop-prob 5 --levels "5,10,15,20" --runs-per-level 100 --batch-size 20
+Step C: Parse PCAPs & Cleanup
+
+Bash
+# Extract features from newly captured PCAPs into CSV
 python3 analyse_pcaps.py
 
-# Generate plots
-python3 plot_results.py
-```
-
-### 5. Cleanup (Optional)
-
-```bash
-# Clean namespace from background processes if needed
+# Clean up namespace and background Chrome processes
 ./clean_netns.sh
-```
-
----
-
-## 📊 Output and Results
-
-**Understanding your results:**
-
-The `out/` directory contains:
-
-### Performance Data
-- **`nav_metrics.csv`** - Navigation timing metrics (page load times, connection durations)
-- **`summary.csv`** - Aggregated network statistics (performance + obfuscation analysis)
-
-### Traffic Analysis Data  
-- **`iat_up.csv, iat_down.csv`** - Inter-arrival time distributions (traffic pattern obfuscation analysis)
-- **`pcaps/`** - Raw packet captures for detailed network analysis
-
-### Visualizations
-- **`plots/`** - Generated charts and graphs:
-  - Bar charts comparing performance across packet drop levels
-  - Cumulative Distribution Functions (CDFs) showing result distributions
-  - Time series plots demonstrating traffic obfuscation effectiveness
-
----
-
-## 🔬 Experimental Design and Methodology
-
-### Research Objectives
-
-This framework investigates **packet dropping as a defense mechanism against website fingerprinting attacks**. We evaluate two critical aspects: (1) **privacy protection** - how effectively controlled packet dropping obfuscates QUIC traffic patterns, and (2) **performance impact** - what costs this defense imposes on user experience. The methodology follows rigorous measurement research principles to ensure reproducible and statistically valid results.
-
-### Experimental Approach Overview
-
-Our approach creates a controlled environment where packet dropping can be precisely applied to QUIC traffic while measuring both traffic pattern obfuscation and web performance impacts. The key insight is that by isolating the network environment and controlling packet drops at the kernel level, we can quantify the privacy-performance trade-offs of traffic obfuscation defenses.
-
-**Experimental Flow**:
-```
-1. Environment Setup → 2. Baseline Measurement → 3. Defense Evaluation → 4. Analysis
-       │                        │                       │                   │
-       ▼                        ▼                       ▼                   ▼
-   Network                 No packet              Fixed & Dynamic        Statistical
-   Isolation               dropping               Drop Rates             Analysis
-```
-
-### System Architecture
-
-```
+🔬 System Architecture
+Plaintext
 ┌─────────────────────────────────────────────┐
-│            NETWORK NAMESPACE                │
-│                                             │
-│  ┌─────────────┐  ┌─────────────┐           │
-│  │   Browser   │  │ eBPF Packet │           │
-│  │   + Selenium│  │ Dropper     │           │
-│  │             │  │ (UDP/443)   │           │
-│  └─────────────┘  └─────────────┘           │
-│         │                 │                 │
-│         ▼                 ▼                 │
+│            NETWORK NAMESPACE (wfns)         │
+│  ┌─────────────┐  ┌──────────────────────┐  │
+│  │   Browser   │  │ eBPF TC Data Plane   │  │
+│  │  + Selenium │  │ - Packet Dropper     │  │
+│  │             │  │ - Dummy Generator    │  │
+│  └─────────────┘  └──────────────────────┘  │
+│         │                    │              │
+│         ▼                    ▼              │
 │  ┌─────────────────────────────────────────┐│
-│  │      Network Interface (veth)           ││
+│  │      Network Interface (veth1 <-> veth0)││
 │  └─────────────────────────────────────────┘│
 └─────────────────┬───────────────────────────┘
                   │
@@ -214,153 +104,3 @@ Our approach creates a controlled environment where packet dropping can be preci
            │  INTERNET   │
            │ (Test Sites)│
            └─────────────┘
-```
-
-#### 1. Network Isolation Layer
-
-**Purpose**: Eliminate external interference and ensure measurement reproducibility.
-
-**Implementation**: Linux network namespaces create a completely isolated network environment:
-- Dedicated virtual network interface (`veth0`/`veth1`) with controlled routing
-- NAT-based internet access while maintaining traffic isolation
-- Custom DNS configuration (1.1.1.1, 8.8.8.8) for consistent resolution
-- Bandwidth allocation: 90% for experimental traffic, 10% for host operations
-
-**Why Critical**: Web performance measurements are severely affected by background traffic, system processes, and variable network conditions. Isolation eliminates these confounding factors.
-
-#### 2. Traffic Obfuscation Defense (eBPF-Based Packet Dropping)
-
-**Purpose**: Implement privacy-preserving defense against website fingerprinting by strategically modifying QUIC traffic patterns.
-
-**Technical Implementation**: eBPF (Extended Berkeley Packet Filter) programs run directly in the kernel for precise traffic manipulation:
-- **Wire-Speed Processing**: Packet drop decisions at line rate without buffering delays
-- **Surgical Precision**: Only UDP packets on port 443 (QUIC) are affected
-- **Minimal Overhead**: Kernel-space execution eliminates context switching costs
-
-**Defense Strategies**:
-1. **Fixed Drop Rate Mode**: Constant packet dropping percentages (1%, 2%, 5%, 10%, 20%)
-   - Evaluates uniform obfuscation effectiveness across all websites
-2. **Dynamic Drop Rate Mode**: Adaptive packet dropping based on traffic volume
-   - Explores traffic-aware defenses that balance privacy and performance
-
-#### 3. Measurement and Analysis Framework
-
-**Browser Control**: Selenium WebDriver with Chrome configured for consistent, reproducible measurements:
-- Clean state for each test (incognito mode, disabled cache)
-- QUIC protocol enforcement and background process elimination
-- Navigation Timing API for precise performance data collection
-
-**Data Collection**: Simultaneous capture of performance metrics and traffic patterns:
-- **Performance**: Page Load Time (PLT), connection duration
-- **Traffic Obfuscation**: Packet counts, byte volumes, inter-arrival timing patterns
-
-### Experimental Protocol
-
-#### Measurement Design
-
-**Single Page Load Flow**:
-```
-Load Page → Apply Defense → Capture Traffic → Measure Performance
-    │            │              │                 │
-    ▼            ▼              ▼                 ▼
-Navigation   eBPF Packet    PCAP Analysis    Page Load Time
-Timing       Dropping       (Pattern         & Connection
-API          (UDP/443)      Changes)         Duration
-```
-
-**Experimental Matrix**:
-- **Test Websites**: Multiple URLs from `urls.txt`
-- **Defense Levels**: Baseline (off) + Fixed rates (1%, 2%, 5%, 10%, 20%) + Dynamic
-- **Repetitions**: 10 runs per condition for statistical validity
-- **Total Measurements**: URLs × 7 defense levels × 10 repetitions
-
-#### Quality Assurance Controls
-
-**Randomization**: URL testing order randomized to prevent temporal bias and learning effects
-
-**Browser Consistency**: Standardized Chrome configuration eliminates browser-related variability:
-```bash
---enable-quic                    # Ensure QUIC protocol usage
---disable-extensions            # Remove extension overhead
---incognito                     # Clean state per measurement
---disable-background-networking # Prevent interference
---disk-cache-size=1            # Force fresh network requests
-```
-
-### Data Collection and Metrics
-
-#### Performance Evaluation Metrics
-
-**Primary Metric**: **Page Load Time (PLT)** - calculated as `loadEventEnd - startTime`
-- Represents user-visible impact of the defense mechanism
-- Standardized metric enabling comparison across different websites
-- Captures cumulative effect of all network interactions during page loading
-
-**Supporting Metrics**:
-- **Connection Duration**: How long QUIC connections remain active under packet loss
-- **Wall-clock Timing**: Independent validation of browser-reported metrics
-
-#### Traffic Obfuscation Analysis Metrics
-
-**Traffic Pattern Changes** (evaluating defense effectiveness):
-- **Traffic Volume**: Total bytes and packet counts in both directions
-- **Packet Timing**: Inter-arrival times showing temporal pattern modifications
-- **Flow Characteristics**: Connection duration changes affecting pattern recognition
-
-**Data Capture Strategy**: Simultaneous packet capture using tcpdump with QUIC-specific filtering (`udp and port 443`) to analyze both performance impacts and obfuscation effectiveness.
-
-### Statistical Analysis and Validation
-
-#### Experimental Rigor
-
-**Replication Strategy**: Multiple repetitions (default: 10 per condition) provide:
-- Sufficient data for statistical significance testing
-- Confidence interval calculation capability
-- Accounting for natural web performance variability
-
-**Statistical Controls**:
-- **Randomization**: URL order randomized to prevent temporal and learning effects
-- **Baseline Comparison**: Reference measurements without packet dropping
-- **Quality Assurance**: Structured data validation and error checking
-
-#### Data Processing Pipeline
-
-```
-Raw Measurements → Validation → Statistical Analysis → Visualization
-       │              │             │                    │
-       ▼              ▼             ▼                    ▼
-   CSV Files      Filtering    Mean ± 95% CI         Bar Charts
-   PCAP Files     Validation   Significance          CDFs
-                  Aggregation  Testing               Time Series
-```
-
-**Output Structure**: Standardized CSV files enable reproducible analysis:
-- `nav_metrics.csv`: Navigation timing data
-- `summary.csv`: Network statistics and performance metrics  
-- `iat_up.csv/iat_down.csv`: Inter-arrival time distributions for obfuscation analysis
-
-#### Statistical Methods
-
-**Confidence Intervals**: All results include 95% confidence intervals using standard error methods for:
-- Statistical rigor in comparing experimental conditions
-- Clear indication of measurement uncertainty
-- Determination of statistically significant differences
-
-**Visualization Approaches**:
-- **Bar Charts**: Mean performance comparison with error bars across packet loss levels
-- **Cumulative Distribution Functions (CDFs)**: Full distribution analysis of measurements
-- **Time Series**: Inter-arrival time patterns demonstrating traffic obfuscation effectiveness
-
-### Research Questions and Applications
-
-This experimental framework enables investigation of critical questions in privacy-preserving web browsing:
-
-1. **Performance Impact**: What is the user experience cost of packet dropping defenses?
-2. **Obfuscation Effectiveness**: How successfully does controlled packet loss alter traffic patterns used for website fingerprinting?
-3. **Defense Optimization**: What is the optimal balance between privacy protection and performance degradation?
-
----
-
-## 📄 License
-
-This project is provided as-is for research and educational purposes. Review and comply with applicable terms of service for websites being measured.

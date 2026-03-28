@@ -1,6 +1,6 @@
 // ebpf/loader.c
 /*
- * - loader.c: PhD Thesis Update Version
+ * 
  * - Supports: fixed, dynamic, dummy_fixed, dummy_dynamic, combined, ingress
  */
 #define _POSIX_C_SOURCE 199309L
