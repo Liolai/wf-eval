@@ -32,7 +32,7 @@ int handle_egress(struct __sk_buff *skb)
     // 这里使用简化版内联解析，避免引用 parse_helpers.h 可能带来的复杂依赖问题，
     // 或者你可以直接用 parse_udp_headers 如果它通过了验证器。
     // 这里保留你原本的内联写法以确保稳定性：
-    
+
     struct ethhdr *eth = data;
     if (data + sizeof(*eth) > data_end) return TC_ACT_OK;
     if (eth->h_proto != bpf_htons(ETH_P_IP)) return TC_ACT_OK;
@@ -47,11 +47,15 @@ int handle_egress(struct __sk_buff *skb)
     if (udp->dest != bpf_htons(QUIC_PORT) && udp->source != bpf_htons(QUIC_PORT))
         return TC_ACT_OK;
 
+    // Packet managed by us
+    __sync_fetch_and_add(&s->packet_count, 1);
+    __sync_fetch_and_add(&s->egress_count, 1);
+
     void *payload = (void *)udp + sizeof(*udp);
     if (payload > data_end) return TC_ACT_OK;
 
     // --- 3. Combined Logic (混合策略逻辑) ---
-    
+
     // 步骤 A: 丢包 (Drop)
     // 如果设置了 drop_probability (比如 Combined 模式)，先尝试丢包
     if (s->drop_probability > 0) {
@@ -64,22 +68,22 @@ int handle_egress(struct __sk_buff *skb)
     // 步骤 B: 假包 (Dummy/Clone)
     // 如果包没被丢弃，检查 dummy_probability 来决定是否生成假包
     if ((bpf_get_prandom_u32() % 100) < s->dummy_probability) {
-        
+
         // 1. 克隆并发送原始包
-        bpf_clone_redirect(skb, skb->ifindex, 0); 
-        
-        __sync_fetch_and_add(&s->packet_count, 1); // 统计假包数量
+        bpf_clone_redirect(skb, skb->ifindex, 0);
+
+        __sync_fetch_and_add(&s->cloned_count, 1); // 统计假包数量
 
         // 2. 修改当前的包 (skb) 使其成为"假包" (Payload Corruption)
         unsigned int cleartext_len = 9;
         if (payload + cleartext_len > data_end) return TC_ACT_OK;
 
         void *payload_to_corrupt = payload + cleartext_len;
-        
+
         #pragma unroll
         for (int i = 0; i < 20; i++) { // 减少循环次数以防验证器超时，20次通常够混淆了
             int offset = i * sizeof(__u32);
-            if (payload_to_corrupt + offset + sizeof(__u32) > data_end) break; 
+            if (payload_to_corrupt + offset + sizeof(__u32) > data_end) break;
 
             __u32 random_bytes = bpf_get_prandom_u32();
             long skb_off = (char *)payload_to_corrupt - (char *)data + offset;
@@ -87,7 +91,7 @@ int handle_egress(struct __sk_buff *skb)
             bpf_skb_store_bytes(skb, skb_off, &random_bytes, sizeof(random_bytes), BPF_F_RECOMPUTE_CSUM);
         }
     }
-    
+
     // 如果没被 Drop，也没变成 Dummy (或者变成了 Dummy)，最终都要放行
     return TC_ACT_OK;
 }

@@ -3,12 +3,12 @@
 #define __PARSE_HELPERS_H
 
 #include <linux/bpf.h>
-#include <bpf/bpf_helpers.h>
+// #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/udp.h>
-#include <linux/in.h> 
+#include <linux/in.h>
 
 #define QUIC_PORT 443
 
@@ -19,6 +19,9 @@
  */
 struct state {
     __u64 packet_count;
+    __u64 ingress_count;
+    __u64 egress_count;
+    __u64 cloned_count;
     __u64 dropped_count;
     __u32 drop_probability;   // 控制丢包 (Drop)
     __u32 dummy_probability;  // 控制假包 (Dummy/Clone)
@@ -51,19 +54,19 @@ static __always_inline int parse_udp_headers(struct __sk_buff *skb, struct packe
     if ((void *)headers->ip + sizeof(*headers->ip) > data_end)
         return 0;
 
-    if (headers->ip->protocol != IPPROTO_UDP) 
+    if (headers->ip->protocol != IPPROTO_UDP)
         return 0; // 只处理 UDP
 
     // 3. L4 (UDP)
     headers->udp = (struct udphdr *)((void *)headers->ip + (headers->ip->ihl * 4));
     if ((void *)headers->udp + sizeof(*headers->udp) > data_end)
         return 0;
-    
+
     // 4. Payload
     headers->payload = (void *)(headers->udp + 1);
     if (headers->payload > data_end)
         return 0;
-    
+
     return 1; // 解析成功
 }
 
