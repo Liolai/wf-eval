@@ -57,10 +57,10 @@ static void cleanup(int sig) {
         printf("\tPacket Count: %llu\n", state.packet_count);
         printf("\tIngress Count: %llu\n", state.ingress_count);
         printf("\tDropped Count: %llu\n", state.dropped_count);
-        printf("\tDrop Probability: %u\n", state.drop_probability);
+        printf("\tDrop Probability: %f\n", (float)state.drop_probability / UINT32_MAX);
         printf("\tEgress Count: %llu\n", state.egress_count);
         printf("\tCloned Count: %llu\n", state.cloned_count);
-        printf("\tDummy Probability: %u\n", state.dummy_probability);
+        printf("\tDummy Probability: %f\n", (float)state.dummy_probability / UINT32_MAX);
         printf("\tDrop Rate: %f%%\n", state.ingress_count ? 100 * (double)state.dropped_count / state.ingress_count : 0);
         printf("\tDummy Rate: %f%%\n", state.egress_count ? 100 * (double)state.cloned_count / state.egress_count : 0);
     }
@@ -103,8 +103,8 @@ int main(int argc, char** argv) {
     __u64 last_time_ns = 0, last_packet_count = 0;
 
     enum operating_mode mode = -1;
-    long prob = 0;
-    long dummy_prob = 0;  // 新增：假包概率
+    float prob = 0;
+    float dummy_prob = 0;  // 新增：假包概率
     long max_prob = DEFAULT_MAX_PROBABILITY;
     long min_rate = DEFAULT_MIN_RATE_PPS;
     long max_rate = DEFAULT_MAX_RATE_PPS;
@@ -144,10 +144,10 @@ int main(int argc, char** argv) {
                 }
                 break;
             case 'p':
-                prob = atol(optarg);
+                prob = atof(optarg);
                 break;
             case 'd':
-                dummy_prob = atol(optarg);
+                dummy_prob = atof(optarg);
                 break;
             case 'P':
                 max_prob = atol(optarg);
@@ -271,15 +271,15 @@ int main(int argc, char** argv) {
 
     // 根据模式设置初始值
     if (mode == MODE_COMBINED) {
-        initial_state.drop_probability = (__u32)prob;
-        initial_state.dummy_probability = (__u32)dummy_prob;
-        printf("Mode COMBINED: Drop %ld%%, Dummy %ld%%\n", prob, dummy_prob);
+        initial_state.drop_probability = (__u32)(prob / 100 * UINT32_MAX);
+        initial_state.dummy_probability = (__u32)(dummy_prob / 100 * UINT32_MAX);
+        printf("Mode COMBINED: Drop %f%%, Dummy %f%%\n", prob, dummy_prob);
     } else if (mode == MODE_DUMMY) {
-        initial_state.dummy_probability = (__u32)prob;
-        printf("Mode DUMMY (Fixed): Prob %ld%%\n", prob);
+        initial_state.dummy_probability = (__u32)(prob / 100 * UINT32_MAX);
+        printf("Mode DUMMY (Fixed): Prob %f%%\n", prob);
     } else if (mode == MODE_FIXED || mode == MODE_INGRESS) {
-        initial_state.drop_probability = (__u32)prob;
-        printf("Mode DROP (Fixed/Ingress): Prob %ld%%\n", prob);
+        initial_state.drop_probability = (__u32)(prob / 100 * UINT32_MAX);
+        printf("Mode DROP (Fixed/Ingress): Prob %f%%\n", prob);
     } else {
         // Dynamic modes start at 0 and adjust
         printf("Mode DYNAMIC (%s): MaxProb %ld%%, Rate %ld-%ld PPS\n",
@@ -309,21 +309,21 @@ int main(int argc, char** argv) {
             last_packet_count = current_state.packet_count;
 
             double pps = (double)count_diff * 1e9 / time_diff_ns;
-            __u32 new_prob = 0;
+            float new_prob = 0;
 
             if (pps > min_rate) {
                 if (pps >= max_rate)
                     new_prob = max_prob;
                 else
-                    new_prob = (__u32)(((pps - min_rate) / (max_rate - min_rate)) * max_prob);
+                    new_prob = (((pps - min_rate) / (max_rate - min_rate)) * max_prob);
             }
 
             // 根据是 Drop Dynamic 还是 Dummy Dynamic 更新不同的字段
             if (mode == MODE_DUMMY_DYNAMIC) {
-                current_state.dummy_probability = new_prob;
+                current_state.dummy_probability = (__u32)(new_prob / 100 * UINT32_MAX);
                 // drop_prob 保持为 0
             } else {
-                current_state.drop_probability = new_prob;
+                current_state.drop_probability = (__u32)(new_prob / 100 * UINT32_MAX);
                 // dummy_prob 保持为 0
             }
 

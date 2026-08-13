@@ -22,10 +22,10 @@ static __always_inline int handle_packet(struct __sk_buff *skb, __u32 direction)
 
     // 统计流量
     __sync_fetch_and_add(&s->packet_count, 1);
-    
+
     // 应用丢包概率 (只看 drop_probability)
     if (s->drop_probability > 0) {
-        if ((bpf_get_prandom_u32() % 100) < s->drop_probability) {
+        if (bpf_get_prandom_u32() % 100 < s->drop_probability) {
             __sync_fetch_and_add(&s->dropped_count, 1);
             return TC_ACT_SHOT; // 丢弃
         }
@@ -42,7 +42,7 @@ int handle_ingress(struct __sk_buff *skb) {
 SEC("classifier")
 int handle_egress(struct __sk_buff *skb) {
     // 修复：现在允许 Egress 丢包
-    return handle_packet(skb, 2); 
+    return handle_packet(skb, 2);
 }
 
 char LICENSE[] SEC("license") = "GPL";

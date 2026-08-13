@@ -55,7 +55,7 @@ int handle_ingress(struct __sk_buff* skb) {
     // 步骤 A: 丢包 (Drop)
     // 如果设置了 drop_probability (比如 Combined 模式)，先尝试丢包
     if (s->drop_probability > 0) {
-        if ((bpf_get_prandom_u32() % 100) < s->drop_probability) {
+        if (bpf_get_prandom_u32() < s->drop_probability) {
             __sync_fetch_and_add(&s->dropped_count, 1);
             return TC_ACT_SHOT;  // 直接丢弃，不发假包
         }
@@ -114,7 +114,7 @@ int handle_egress(struct __sk_buff* skb) {
 
     // 步骤 B: 假包 (Dummy/Clone)
     // 如果包没被丢弃，检查 dummy_probability 来决定是否生成假包
-    if ((bpf_get_prandom_u32() % 100) < s->dummy_probability) {
+    if (bpf_get_prandom_u32() < s->dummy_probability) {
         // 1. 克隆并发送原始包
         bpf_clone_redirect(skb, skb->ifindex, 0);
 
