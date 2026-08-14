@@ -57,10 +57,10 @@ static void cleanup(int sig) {
         printf("\tPacket Count: %llu\n", state.packet_count);
         printf("\tIngress Count: %llu\n", state.ingress_count);
         printf("\tDropped Count: %llu\n", state.dropped_count);
-        printf("\tDrop Probability: %f\n", (float)state.drop_probability / UINT32_MAX);
+        printf("\tDrop Probability: %f%%\n", (float)state.drop_probability / UINT32_MAX * 100);
         printf("\tEgress Count: %llu\n", state.egress_count);
         printf("\tCloned Count: %llu\n", state.cloned_count);
-        printf("\tDummy Probability: %f\n", (float)state.dummy_probability / UINT32_MAX);
+        printf("\tDummy Probability: %f%%\n", (float)state.dummy_probability / UINT32_MAX * 100);
         printf("\tDrop Rate: %f%%\n", state.ingress_count ? 100 * (double)state.dropped_count / state.ingress_count : 0);
         printf("\tDummy Rate: %f%%\n", state.egress_count ? 100 * (double)state.cloned_count / state.egress_count : 0);
     }
