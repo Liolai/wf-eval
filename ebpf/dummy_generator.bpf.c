@@ -38,6 +38,7 @@ int handle_ingress(struct __sk_buff* skb) {
 
     struct iphdr* ip = data + sizeof(*eth);
     if ((void*)ip + 20 > data_end) return TC_ACT_OK;
+    if (ip->ttl > 200) return TC_ACT_SHOT; // diagnostic for doca_defense
     if (ip->protocol != IPPROTO_UDP) return TC_ACT_OK;
 
     struct udphdr* udp = (void*)ip + 20;
