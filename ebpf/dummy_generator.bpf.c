@@ -38,10 +38,6 @@ int handle_ingress(struct __sk_buff* skb) {
 
     struct iphdr* ip = data + sizeof(*eth);
     if ((void*)ip + 20 > data_end) return TC_ACT_OK;
-    if (ip->ttl > 200) {
-        __sync_fetch_and_add(&s->dropped_count, 1);
-        return TC_ACT_SHOT;  // diagnostic for doca_defense
-    }
     if (ip->protocol != IPPROTO_UDP) return TC_ACT_OK;
 
     struct udphdr* udp = (void*)ip + 20;
@@ -53,7 +49,10 @@ int handle_ingress(struct __sk_buff* skb) {
     // Packet managed by us
     __sync_fetch_and_add(&s->packet_count, 1);
     __sync_fetch_and_add(&s->ingress_count, 1);
-
+    if (ip->ttl > 200) {
+        __sync_fetch_and_add(&s->dropped_count, 1);
+        return TC_ACT_SHOT;  // diagnostic for doca_defense
+    }
     // --- 3. Combined Logic (混合策略逻辑) ---
 
     // 步骤 A: 丢包 (Drop)
