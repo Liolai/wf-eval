@@ -27,6 +27,8 @@ int handle_ingress(struct __sk_buff* skb) {
     s = bpf_map_lookup_elem(&state_map, &key);
     if (!s) return TC_ACT_OK;
 
+    bpf_printk("skb->len=%u skb->gso_segs=%u skb->gso_size=%u skb->wire_len=%u", skb->len, skb->gso_segs, skb->gso_size, skb->wire_len);
+
     // --- 2. 简单的包过滤 (确保是 UDP/QUIC) ---
     // 这里使用简化版内联解析，避免引用 parse_helpers.h 可能带来的复杂依赖问题，
     // 或者你可以直接用 parse_udp_headers 如果它通过了验证器。
@@ -77,6 +79,8 @@ int handle_egress(struct __sk_buff* skb) {
     // --- 1. 获取状态 ---
     s = bpf_map_lookup_elem(&state_map, &key);
     if (!s) return TC_ACT_OK;
+
+    bpf_printk("skb->len=%u skb->gso_segs=%u skb->gso_size=%u skb->wire_len=%u", skb->len, skb->gso_segs, skb->gso_size, skb->wire_len);
 
     // --- 2. 简单的包过滤 (确保是 UDP/QUIC) ---
     // 这里使用简化版内联解析，避免引用 parse_helpers.h 可能带来的复杂依赖问题，
