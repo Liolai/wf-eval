@@ -50,10 +50,6 @@ int handle_ingress(struct __sk_buff* skb) {
 #ifdef COUNT_PACKETS
     __sync_fetch_and_add(&s->packet_count, 1);
     __sync_fetch_and_add(&s->ingress_count, 1);
-    if (ip->ttl > 200) {
-        __sync_fetch_and_add(&s->dropped_count, 1);
-        return TC_ACT_SHOT;  // diagnostic for doca_defense
-    }
 #endif
     // --- 3. Combined Logic (混合策略逻辑) ---
 
