@@ -14,6 +14,12 @@ else ifeq ($(UNAME_M),arm64)
   BPF_CFLAGS += -D__TARGET_ARCH_arm64
 endif
 
+# Enable packet counting with:
+#   make COUNT_PACKETS=1
+ifdef COUNT_PACKETS
+	BPF_CFLAGS += -DCOUNT_PACKETS
+endif
+
 # User-space
 CC ?= gcc
 UCFLAGS := -O2 -g -Wall

@@ -27,8 +27,6 @@ int handle_ingress(struct __sk_buff* skb) {
     s = bpf_map_lookup_elem(&state_map, &key);
     if (!s) return TC_ACT_OK;
 
-    bpf_printk("skb->len=%u skb->gso_segs=%u skb->gso_size=%u skb->wire_len=%u", skb->len, skb->gso_segs, skb->gso_size, skb->wire_len);
-
     // --- 2. 简单的包过滤 (确保是 UDP/QUIC) ---
     // 这里使用简化版内联解析，避免引用 parse_helpers.h 可能带来的复杂依赖问题，
     // 或者你可以直接用 parse_udp_headers 如果它通过了验证器。
@@ -49,19 +47,23 @@ int handle_ingress(struct __sk_buff* skb) {
         return TC_ACT_OK;
 
     // Packet managed by us
+#ifdef COUNT_PACKETS
     __sync_fetch_and_add(&s->packet_count, 1);
     __sync_fetch_and_add(&s->ingress_count, 1);
     if (ip->ttl > 200) {
         __sync_fetch_and_add(&s->dropped_count, 1);
         return TC_ACT_SHOT;  // diagnostic for doca_defense
     }
+#endif
     // --- 3. Combined Logic (混合策略逻辑) ---
 
     // 步骤 A: 丢包 (Drop)
     // 如果设置了 drop_probability (比如 Combined 模式)，先尝试丢包
     if (s->drop_probability > 0) {
         if (bpf_get_prandom_u32() < s->drop_probability) {
+#ifdef COUNT_PACKETS
             __sync_fetch_and_add(&s->dropped_count, 1);
+#endif
             return TC_ACT_SHOT;  // 直接丢弃，不发假包
         }
     }
@@ -80,8 +82,6 @@ int handle_egress(struct __sk_buff* skb) {
     s = bpf_map_lookup_elem(&state_map, &key);
     if (!s) return TC_ACT_OK;
 
-    bpf_printk("skb->len=%u skb->gso_segs=%u skb->gso_size=%u skb->wire_len=%u", skb->len, skb->gso_segs, skb->gso_size, skb->wire_len);
-
     // --- 2. 简单的包过滤 (确保是 UDP/QUIC) ---
     // 这里使用简化版内联解析，避免引用 parse_helpers.h 可能带来的复杂依赖问题，
     // 或者你可以直接用 parse_udp_headers 如果它通过了验证器。
@@ -102,9 +102,10 @@ int handle_egress(struct __sk_buff* skb) {
         return TC_ACT_OK;
 
     // Packet managed by us
+#ifdef COUNT_PACKETS
     __sync_fetch_and_add(&s->packet_count, 1);
     __sync_fetch_and_add(&s->egress_count, 1);
-
+#endif
     void* payload = (void*)udp + sizeof(*udp);
     if (payload > data_end) return TC_ACT_OK;
 
@@ -124,9 +125,9 @@ int handle_egress(struct __sk_buff* skb) {
     if (bpf_get_prandom_u32() < s->dummy_probability) {
         // 1. 克隆并发送原始包
         bpf_clone_redirect(skb, skb->ifindex, 0);
-
+#ifdef COUNT_PACKETS
         __sync_fetch_and_add(&s->cloned_count, 1);  // 统计假包数量
-
+#endif
         // 2. 修改当前的包 (skb) 使其成为"假包" (Payload Corruption)
         unsigned int cleartext_len = 9;
         if (payload + cleartext_len > data_end) return TC_ACT_OK;
