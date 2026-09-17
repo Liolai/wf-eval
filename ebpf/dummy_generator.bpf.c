@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/bpf.h>
 #include <linux/pkt_cls.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
+#include <linux/udp.h>
 #include <bpf/bpf_helpers.h>
 
 #include "parse_helpers.h"  // 现在我们使用 parse_helpers.h 里的 struct state
@@ -34,13 +38,25 @@ int handle_ingress(struct __sk_buff* skb) {
 
     struct ethhdr* eth = data;
     if (data + sizeof(*eth) > data_end) return TC_ACT_OK;
-    if (eth->h_proto != bpf_htons(ETH_P_IP)) return TC_ACT_OK;
+    struct udphdr* udp;
+    if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+        struct iphdr* ip = data + sizeof(*eth);
+        if ((void*)ip + sizeof(*ip) > data_end) return TC_ACT_OK;
+        __u32 iphdr_len = ip->ihl * 4;
+        if (iphdr_len < sizeof(*ip)) return TC_ACT_OK;
+        if ((void*)ip + iphdr_len > data_end) return TC_ACT_OK;
+        if (ip->protocol != IPPROTO_UDP) return TC_ACT_OK;
+        udp = (void*)ip + iphdr_len;
 
-    struct iphdr* ip = data + sizeof(*eth);
-    if ((void*)ip + 20 > data_end) return TC_ACT_OK;
-    if (ip->protocol != IPPROTO_UDP) return TC_ACT_OK;
+    } else if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+        struct ipv6hdr* ipv6 = data + sizeof(*eth);
+        if ((void*)ipv6 + sizeof(*ipv6) > data_end) return TC_ACT_OK;
+        if (ipv6->nexthdr != IPPROTO_UDP) return TC_ACT_OK;
+        udp = (void*)ipv6 + sizeof(*ipv6);
+    } else {
+        return TC_ACT_OK;
+    }
 
-    struct udphdr* udp = (void*)ip + 20;
     if ((void*)udp + sizeof(*udp) > data_end) return TC_ACT_OK;
 
     if (udp->dest != bpf_htons(QUIC_PORT) && udp->source != bpf_htons(QUIC_PORT))
@@ -85,13 +101,25 @@ int handle_egress(struct __sk_buff* skb) {
 
     struct ethhdr* eth = data;
     if (data + sizeof(*eth) > data_end) return TC_ACT_OK;
-    if (eth->h_proto != bpf_htons(ETH_P_IP)) return TC_ACT_OK;
+    struct udphdr* udp;
+    if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+        struct iphdr* ip = data + sizeof(*eth);
+        if ((void*)ip + sizeof(*ip) > data_end) return TC_ACT_OK;
+        __u32 iphdr_len = ip->ihl * 4;
+        if (iphdr_len < sizeof(*ip)) return TC_ACT_OK;
+        if ((void*)ip + iphdr_len > data_end) return TC_ACT_OK;
+        if (ip->protocol != IPPROTO_UDP) return TC_ACT_OK;
+        udp = (void*)ip + iphdr_len;
 
-    struct iphdr* ip = data + sizeof(*eth);
-    if ((void*)ip + 20 > data_end) return TC_ACT_OK;
-    if (ip->protocol != IPPROTO_UDP) return TC_ACT_OK;
+    } else if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+        struct ipv6hdr* ipv6 = data + sizeof(*eth);
+        if ((void*)ipv6 + sizeof(*ipv6) > data_end) return TC_ACT_OK;
+        if (ipv6->nexthdr != IPPROTO_UDP) return TC_ACT_OK;
+        udp = (void*)ipv6 + sizeof(*ipv6);
+    } else {
+        return TC_ACT_OK;
+    }
 
-    struct udphdr* udp = (void*)ip + 20;
     if ((void*)udp + sizeof(*udp) > data_end) return TC_ACT_OK;
 
     if (udp->dest != bpf_htons(QUIC_PORT) && udp->source != bpf_htons(QUIC_PORT))
