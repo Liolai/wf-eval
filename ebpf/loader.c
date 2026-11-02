@@ -64,6 +64,7 @@ static void cleanup(int sig) {
         printf("\tDrop Rate: %f%%\n", state.ingress_count ? 100 * (double)state.dropped_count / state.ingress_count : 0);
         printf("\tDummy Rate: %f%%\n", state.egress_count ? 100 * (double)state.cloned_count / state.egress_count : 0);
         printf("\tCorrupt Packets: %s\n", state.corrupt_packets ? "True" : "False");
+        printf("\tDisable Looping: %s\n", state.disable_looping ? "True" : "False");
     }
 
     DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook, .ifindex = ifindex_g,
@@ -95,6 +96,7 @@ static void usage(const char* prog) {
             "  --min-rate <int>     Min PPS to start triggering (default: %d)\n"
             "  --max-rate <int>     Max PPS to reach max prob (default: %d)\n"
             "  --corrupt            Corrupt Packets\n",
+            "  --enable-looping     Enable Looping for Dummy Packets\n",
             prog, DEFAULT_MAX_PROBABILITY, DEFAULT_MIN_RATE_PPS, DEFAULT_MAX_RATE_PPS);
 }
 
@@ -112,6 +114,7 @@ int main(int argc, char** argv) {
     long max_rate = DEFAULT_MAX_RATE_PPS;
     int opt;
     bool corrupt_packets = false;
+    bool enable_looping = false;  // 新增：是否允许假包循环
 
     static struct option long_options[] = {
         {"mode", required_argument, 0, 0},
@@ -121,11 +124,12 @@ int main(int argc, char** argv) {
         {"min-rate", required_argument, 0, 'm'},
         {"max-rate", required_argument, 0, 'M'},
         {"corrupt", no_argument, 0, 'c'},
+        {"enable-looping", no_argument, 0, 'l'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}};
 
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "p:d:P:m:M:ch", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:d:P:m:M:chl", long_options, &option_index)) != -1) {
         switch (opt) {
             case 0:
                 if (strcmp("mode", long_options[option_index].name) == 0) {
@@ -164,6 +168,9 @@ int main(int argc, char** argv) {
                 break;
             case 'c':
                 corrupt_packets = true;
+                break;
+            case 'l':
+                enable_looping = true;
                 break;
             case 'h':
             default:
@@ -278,6 +285,7 @@ int main(int argc, char** argv) {
 
     // 根据模式设置初始值
     initial_state.corrupt_packets = corrupt_packets;
+    initial_state.disable_looping = !enable_looping;  // if enable_looping is true, disable_looping should be false
     if (mode == MODE_COMBINED) {
         initial_state.drop_probability = (__u32)(prob / 100 * UINT32_MAX);
         initial_state.dummy_probability = (__u32)(dummy_prob / 100 * UINT32_MAX);

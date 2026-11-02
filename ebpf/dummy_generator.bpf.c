@@ -10,6 +10,7 @@
 
 #include "parse_helpers.h"  // 现在我们使用 parse_helpers.h 里的 struct state
 
+#define MARK_VALUE 0x1
 /* * Map 定义
  * 注意：struct state 现在来自 parse_helpers.h，包含了 dummy_probability
  */
@@ -93,6 +94,9 @@ int handle_egress(struct __sk_buff* skb) {
     // --- 1. 获取状态 ---
     s = bpf_map_lookup_elem(&state_map, &key);
     if (!s) return TC_ACT_OK;
+    if (skb->mark == MARK_VALUE) { // if marked, skip to avoid looping
+        return TC_ACT_OK;
+    }
 
     // --- 2. 简单的包过滤 (确保是 UDP/QUIC) ---
     // 这里使用简化版内联解析，避免引用 parse_helpers.h 可能带来的复杂依赖问题，
@@ -148,6 +152,9 @@ int handle_egress(struct __sk_buff* skb) {
     // 如果包没被丢弃，检查 dummy_probability 来决定是否生成假包
     if (bpf_get_prandom_u32() < s->dummy_probability) {
         // 1. 克隆并发送原始包
+        if (s->disable_looping) {
+            skb->mark = MARK_VALUE; // mark the packet for identification if needed
+        }
         bpf_clone_redirect(skb, skb->ifindex, 0);
 #ifdef COUNT_PACKETS
         __sync_fetch_and_add(&s->cloned_count, 1);  // 统计假包数量
