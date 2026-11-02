@@ -153,20 +153,22 @@ int handle_egress(struct __sk_buff* skb) {
         __sync_fetch_and_add(&s->cloned_count, 1);  // 统计假包数量
 #endif
         // 2. 修改当前的包 (skb) 使其成为"假包" (Payload Corruption)
-        unsigned int cleartext_len = 9;
-        if (payload + cleartext_len > data_end) return TC_ACT_OK;
+        if (s->corrupt_packets) {
+            unsigned int cleartext_len = 9;
+            if (payload + cleartext_len > data_end) return TC_ACT_OK;
 
-        void* payload_to_corrupt = payload + cleartext_len;
+            void* payload_to_corrupt = payload + cleartext_len;
 
 #pragma unroll
-        for (int i = 0; i < 20; i++) {  // 减少循环次数以防验证器超时，20次通常够混淆了
-            int offset = i * sizeof(__u32);
-            if (payload_to_corrupt + offset + sizeof(__u32) > data_end) break;
+            for (int i = 0; i < 20; i++) {  // 减少循环次数以防验证器超时，20次通常够混淆了
+                int offset = i * sizeof(__u32);
+                if (payload_to_corrupt + offset + sizeof(__u32) > data_end) break;
 
-            __u32 random_bytes = bpf_get_prandom_u32();
-            long skb_off = (char*)payload_to_corrupt - (char*)data + offset;
+                __u32 random_bytes = bpf_get_prandom_u32();
+                long skb_off = (char*)payload_to_corrupt - (char*)data + offset;
 
-            bpf_skb_store_bytes(skb, skb_off, &random_bytes, sizeof(random_bytes), BPF_F_RECOMPUTE_CSUM);
+                bpf_skb_store_bytes(skb, skb_off, &random_bytes, sizeof(random_bytes), BPF_F_RECOMPUTE_CSUM);
+            }
         }
     }
 

@@ -25,6 +25,7 @@ struct state {
     __u64 dropped_count;
     __u32 drop_probability;   // 控制丢包 (Drop)
     __u32 dummy_probability;  // 控制假包 (Dummy/Clone)
+    __u8 corrupt_packets;     // Whether to corrupt dummy packets
 };
 
 // 定义一个结构体来保存解析结果

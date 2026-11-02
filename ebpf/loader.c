@@ -63,6 +63,7 @@ static void cleanup(int sig) {
         printf("\tDummy Probability: %f%%\n", (float)state.dummy_probability / UINT32_MAX * 100);
         printf("\tDrop Rate: %f%%\n", state.ingress_count ? 100 * (double)state.dropped_count / state.ingress_count : 0);
         printf("\tDummy Rate: %f%%\n", state.egress_count ? 100 * (double)state.cloned_count / state.egress_count : 0);
+        printf("\tCorrupt Packets: %s\n", state.corrupt_packets ? "True" : "False");
     }
 
     DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook, .ifindex = ifindex_g,
@@ -92,7 +93,8 @@ static void usage(const char* prog) {
             "  --dummy-prob <int>   Dummy Probability (0-100) [Required for combined]\n"
             "  --max-prob <int>     Max Probability for dynamic modes (default: %d)\n"
             "  --min-rate <int>     Min PPS to start triggering (default: %d)\n"
-            "  --max-rate <int>     Max PPS to reach max prob (default: %d)\n",
+            "  --max-rate <int>     Max PPS to reach max prob (default: %d)\n"
+            "  --corrupt            Corrupt Packets\n",
             prog, DEFAULT_MAX_PROBABILITY, DEFAULT_MIN_RATE_PPS, DEFAULT_MAX_RATE_PPS);
 }
 
@@ -109,6 +111,7 @@ int main(int argc, char** argv) {
     long min_rate = DEFAULT_MIN_RATE_PPS;
     long max_rate = DEFAULT_MAX_RATE_PPS;
     int opt;
+    bool corrupt_packets = false;
 
     static struct option long_options[] = {
         {"mode", required_argument, 0, 0},
@@ -117,11 +120,12 @@ int main(int argc, char** argv) {
         {"max-prob", required_argument, 0, 'P'},
         {"min-rate", required_argument, 0, 'm'},
         {"max-rate", required_argument, 0, 'M'},
+        {"corrupt", no_argument, 0, 'c'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}};
 
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "p:d:P:m:M:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:d:P:m:M:ch", long_options, &option_index)) != -1) {
         switch (opt) {
             case 0:
                 if (strcmp("mode", long_options[option_index].name) == 0) {
@@ -157,6 +161,9 @@ int main(int argc, char** argv) {
                 break;
             case 'M':
                 max_rate = atol(optarg);
+                break;
+            case 'c':
+                corrupt_packets = true;
                 break;
             case 'h':
             default:
@@ -270,6 +277,7 @@ int main(int argc, char** argv) {
     struct state initial_state = {0};
 
     // 根据模式设置初始值
+    initial_state.corrupt_packets = corrupt_packets;
     if (mode == MODE_COMBINED) {
         initial_state.drop_probability = (__u32)(prob / 100 * UINT32_MAX);
         initial_state.dummy_probability = (__u32)(dummy_prob / 100 * UINT32_MAX);
